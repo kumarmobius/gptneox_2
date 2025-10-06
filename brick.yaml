@@ -1,4 +1,4 @@
-name: GPTNeoX
+name: GPTNeoXx
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, then saves initial weights, JSON config, and model source.
 
 inputs:
