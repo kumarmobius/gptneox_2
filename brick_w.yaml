@@ -1,4 +1,4 @@
-name: GPTNeoX
+name: GPTNeoX Model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -13,7 +13,8 @@ outputs:
     type: Data
   - name: model_py
     type: Data
-    description: The model's Python source code will be saved as this output.
+    description: The Python model source code will be saved here after it is generated.
+
 implementation:
   container:
     image: python:3.9
@@ -27,7 +28,7 @@ implementation:
         import torch
         from tokenizers import Tokenizer
 
-        # Install runtime dependencies
+        # Install runtime deps (quiet)
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo", "numpy"], check=True, capture_output=True)
 
         # === embedded model source (written to model_py at runtime) ===
