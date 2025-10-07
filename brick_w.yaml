@@ -26,7 +26,8 @@ implementation:
         import torch
         from tokenizers import Tokenizer
 
-        # Install runtime deps (quiet)
+        # Ensure pip is up to date and install necessary dependencies
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=True, capture_output=True)
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo", "numpy"], check=True, capture_output=True)
 
         # === embedded model source (written to model_py at runtime) ===
@@ -268,4 +269,4 @@ implementation:
       - --model-config
       - {outputPath: model_config}
       - --model_py
-      - {outputPath: model_py}
+      - {outputPath: /tmp/outputs/model_py/model.py}
