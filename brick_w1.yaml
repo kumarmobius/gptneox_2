@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -193,67 +193,28 @@ implementation:
             ap.add_argument("--model_py", required=True)
             args = ap.parse_args()
 
-            print(f"[INFO] Starting GPTNeoX model creation")
-            print(f"[INFO] Tokenizer path: {args.tokenizer_json}")
-            print(f"[INFO] Number of layers: {args.num_layers}")
+            # Ensure model_py path is correct and directory exists
+            model_py_abs = os.path.abspath(args.model_py)
+            print(f"[INFO] Model path (absolute): {model_py_abs}")
 
-            # Verify tokenizer file exists
-            if not os.path.exists(args.tokenizer_json):
-                print(f"[ERROR] Tokenizer file not found: {args.tokenizer_json}")
+            # Ensure the directory exists before writing the model source code
+            os.makedirs(os.path.dirname(model_py_abs), exist_ok=True)
+
+            try:
+                with open(model_py_abs, "w", encoding="utf-8") as f:
+                    f.write(MODEL_PY)
+                print(f"[INFO] Model source saved to {model_py_abs}")
+            except Exception as e:
+                print(f"[ERROR] Failed to write to {model_py_abs}: {e}")
                 sys.exit(1)
 
-            # Load tokenizer
-            print("[INFO] Loading tokenizer...")
-            tok = Tokenizer.from_file(args.tokenizer_json)
-            vocab_size = tok.get_vocab_size()
-            print(f"[INFO] Vocabulary size: {vocab_size}")
-
-            # Set device and dtype
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model_dtype = torch.float16 if device == "cuda" else torch.float32
-            print(f"[INFO] Using device: {device}, dtype: {model_dtype}")
-
-            # Create config
-            CONFIG = {
-                "vocab_size": vocab_size,
-                "emb_dim": 512,
-                "num_heads": 8,
-                "num_layers": args.num_layers,
-                "ff_mult": 4,
-                "dropout": 0.0,
-                "rotary_pct": 0.25,
-                "max_seq_len": 512,
-                "dtype": "float16" if model_dtype == torch.float16 else "float32",
-            }
-
-            # Save config
-            print("[INFO] Saving model config...")
-            cfg_to_save = dict(CONFIG)
-            output_dir = os.path.dirname(args.model_config)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            with open(args.model_config, "w", encoding="utf-8") as f:
-                json.dump(cfg_to_save, f, indent=2)
-            print(f"[INFO] Config saved to {args.model_config}")
-
-            # Save model source
-            print("[INFO] Saving model Python source...")
-            output_dir = os.path.dirname(args.model_py)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            with open(args.model_py, "w", encoding="utf-8") as f:
-                f.write(MODEL_PY)
-            print(f"[INFO] Model source saved to {args.model_py}")
-
             # Verify model file was created
-            if not os.path.exists(args.model_py):
-                print(f"[ERROR] Model file was not created: {args.model_py}")
+            if not os.path.exists(model_py_abs):
+                print(f"[ERROR] Model Python file not found at {model_py_abs}")
                 sys.exit(1)
 
             # Import the model with absolute path
             print("[INFO] Loading model module...")
-            model_py_abs = os.path.abspath(args.model_py)
-            print(f"[INFO] Model path (absolute): {model_py_abs}")
             
             spec = importlib.util.spec_from_file_location("tinygpt_neox_model", model_py_abs)
             if spec is None:
