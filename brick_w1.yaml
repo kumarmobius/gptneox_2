@@ -23,13 +23,14 @@ implementation:
       - |
         import subprocess, sys, os, json, argparse, importlib.util, textwrap
         # Install runtime deps (quiet)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "math"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "math", "torchinfo"], check=True)
+        from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
         import textwrap
 
         # === embedded model source (written to model_py at runtime) ===
-        MODEL_PY = textwrap.dedent(r'''\
+        MODEL_PY = '''
         import math
         import torch
         import torch.nn as nn
@@ -167,7 +168,7 @@ implementation:
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
-        ''')
+        '''
 
         def write_output(path, value, mode="w"):
             try:
@@ -197,7 +198,7 @@ implementation:
 
             tok = Tokenizer.from_file(args.tokenizer_json)
             vocab_size = tok.get_vocab_size()
-            print("[INFO] Loaded tokenizer with vocab_size=" + str(vocab_size))
+            #print("[INFO] Loaded tokenizer with vocab_size=" + str(vocab_size))
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model_dtype = torch.float16 if device == "cuda" else torch.float32
@@ -219,32 +220,36 @@ implementation:
             os.makedirs(os.path.dirname(args.model_config) or ".", exist_ok=True)
             with open(args.model_config, "w", encoding="utf-8") as f:
                 json.dump(cfg_to_save, f, indent=2)
-            print("[INFO] Model config saved to " + args.model_config)
+            #print("[INFO] Model config saved to " + args.model_config)
 
             # Write model source file (dedented to avoid indentation artifacts)
             model_py_text = textwrap.dedent(MODEL_PY.lstrip('\n'))
             os.makedirs(os.path.dirname(args.model_py) or ".", exist_ok=True)
             with open(args.model_py, "w", encoding="utf-8") as f:
                 f.write(model_py_text)
-            print("[INFO] Model source saved to " + args.model_py)
+            #print("[INFO] Model source saved to " + args.model_py)
 
             # Dynamically import and instantiate to save weights
             spec = importlib.util.spec_from_file_location("tinygpt_neox_model", args.model_py)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
 
-            model = mod.TinyGPTNeoX(CONFIG)
+            model = mod.TinyGPTNeoX(CONFIG).to(device)
             if model_dtype == torch.float16:
                 model.half()
             model.to(device).eval()
 
+            summary(model, input_data=torch.randint(0, CONFIG['vocab_size'], (1, 32)).to(device))
+            
+
             os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
             torch.save(model.state_dict(), args.model_weights)
-            print("[INFO] Weights saved to " + args.model_weights)
+            #print("[INFO] Weights saved to " + args.model_weights)
 
             n_params = sum(p.numel() for p in model.parameters())
             num_layers = CONFIG["num_layers"]
-            print(f"[INFO] TinyGPTNeoX init complete: layers={num_layers} params={n_params} device={device}")
+           # print(f"[INFO] TinyGPTNeoX init complete: layers={num_layers} params={n_params} device={device}")
+           
 
         if __name__ == "__main__":
             main()
