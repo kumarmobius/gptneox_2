@@ -26,13 +26,15 @@ implementation:
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers"], check=True)
         import torch
         from tokenizers import Tokenizer
+        import textwrap
 
         # === embedded model source (written to model_py at runtime) ===
-        MODEL_PY = r"""\
+        MODEL_PY = textwrap.dedent(r"""\
         import math
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
+        
 
         def rotate_half(x):
             x1 = x[..., ::2]
@@ -166,7 +168,7 @@ implementation:
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
-        """
+        """)
 
         def write_output(path, value, mode="w"):
             try:
