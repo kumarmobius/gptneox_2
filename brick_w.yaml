@@ -268,4 +268,4 @@ implementation:
       - --model_config
       - {outputPath: model_config}
       - --model_py
-      - {outputPath: model_py}
+      - {outputPath: /tmp/outputs/model_py/model.py}
