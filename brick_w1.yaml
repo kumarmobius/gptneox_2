@@ -29,7 +29,7 @@ implementation:
         import textwrap
 
         # === embedded model source (written to model_py at runtime) ===
-        MODEL_PY = textwrap.dedent(r"""\
+        MODEL_PY = textwrap.dedent(r'''\
         import math
         import torch
         import torch.nn as nn
@@ -167,7 +167,7 @@ implementation:
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
-        """)
+        ''')
 
         def write_output(path, value, mode="w"):
             try:
