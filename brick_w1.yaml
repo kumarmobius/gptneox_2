@@ -23,7 +23,7 @@ implementation:
       - |
         import subprocess, sys, os, json, argparse, importlib.util, textwrap
         # Install runtime deps (quiet)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo","numpy"], check=True)
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
@@ -218,7 +218,7 @@ implementation:
                 json.dump(cfg_to_save, f, indent=2)
 
             os.makedirs(os.path.dirname(args.model_py) or ".", exist_ok=True)
-            with open(args.model_py, "wb", encoding="utf-8") as f:
+            with open(args.model_py, "w", encoding="utf-8") as f:
                 f.write(MODEL_PY)
 
             spec = importlib.util.spec_from_file_location("tinygpt_neox_model", args.model_py)
