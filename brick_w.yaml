@@ -259,13 +259,13 @@ implementation:
         if __name__ == "__main__":
             main()
     args:
-      - --tokenizer_json
+      - --tokenizer-json
       - {inputPath: tokenizer_json}
-      - --num_layers
+      - --num-layers
       - {inputValue: num_layers}
-      - --model_weights
+      - --model-weights
       - {outputPath: model_weights}
-      - --model_config
+      - --model-config
       - {outputPath: model_config}
       - --model_py
-      - {outputPath: /tmp/outputs/model_py/model.py}
+      - {outputPath: model_py}
