@@ -1,4 +1,4 @@
-name: GPTNeoX
+name: GPTNeoX Model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -269,4 +269,4 @@ implementation:
       - --model-config
       - {outputPath: model_config}
       - --model_py
-      - {outputPath: /tmp/outputs/model_py/model.py}
+      - {outputPath: /tmp/outputs/model_py/model.py}  # Corrected path for model_py
