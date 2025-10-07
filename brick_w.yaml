@@ -28,7 +28,7 @@ implementation:
         from tokenizers import Tokenizer
 
         # === embedded model source (written to model_py at runtime) ===
-        MODEL_PY = r"""
+        MODEL_PY = r"""\
         import math
         import torch
         import torch.nn as nn
