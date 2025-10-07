@@ -23,7 +23,7 @@ implementation:
       - |
         import subprocess, sys, os, json, argparse, importlib.util, textwrap
         # Install runtime deps (quiet)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "math", "torchinfo"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo"], check=True)
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
@@ -239,8 +239,8 @@ implementation:
                 model.half()
             model.to(device).eval()
 
-            summary(model, input_data=torch.randint(0, CONFIG['vocab_size'], (1, 32)).to(device))
-            
+            vocab_sz = CONFIG["vocab_size"]
+            summary(model, input_data=torch.randint(0, vocab_sz, (1, 32)).to(device))
 
             os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
             torch.save(model.state_dict(), args.model_weights)
@@ -249,7 +249,6 @@ implementation:
             n_params = sum(p.numel() for p in model.parameters())
             num_layers = CONFIG["num_layers"]
            # print(f"[INFO] TinyGPTNeoX init complete: layers={num_layers} params={n_params} device={device}")
-           
 
         if __name__ == "__main__":
             main()
