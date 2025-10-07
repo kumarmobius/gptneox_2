@@ -27,7 +27,6 @@ implementation:
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
-        import textwrap
 
         # === embedded model source (written to model_py at runtime) ===
         MODEL_PY = '''
@@ -218,10 +217,9 @@ implementation:
             with open(args.model_config, "w", encoding="utf-8") as f:
                 json.dump(cfg_to_save, f, indent=2)
 
-            model_py_text = textwrap.dedent(MODEL_PY.lstrip('\n'))
             os.makedirs(os.path.dirname(args.model_py) or ".", exist_ok=True)
-            with open(args.model_py, "w", encoding="utf-8") as f:
-                f.write(model_py_text)
+            with open(args.model_py, "wb", encoding="utf-8") as f:
+                f.write(MODEL_PY)
 
             spec = importlib.util.spec_from_file_location("tinygpt_neox_model", args.model_py)
             mod = importlib.util.module_from_spec(spec)
