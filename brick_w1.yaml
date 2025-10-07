@@ -30,10 +30,10 @@ implementation:
 
         # === embedded model source (written to model_py at runtime) ===
         MODEL_PY = '''
-        # import math
-        # import torch
-        # import torch.nn as nn
-        # import torch.nn.functional as F
+        import math
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
 
         def rotate_half(x):
             x1 = x[..., ::2]
