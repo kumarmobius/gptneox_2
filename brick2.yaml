@@ -176,10 +176,6 @@ implementation:
                 return logits, new_kvs
 
         class Gemma3Model(TinyGPTNeoX):
-            """
-            Compatibility wrapper so trainer components looking for 'Gemma3Model'
-            can load this model without modification.
-            """
             def forward(self, input_ids, labels=None):
                 logits, _ = super().forward(input_ids)
                 loss = None
