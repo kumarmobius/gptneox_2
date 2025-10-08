@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -129,6 +129,8 @@ implementation:
                 x = x + ff_out
                 return x, present_kv
 
+        
+
         class TinyGPTNeoX(nn.Module):
             def __init__(self, cfg):
                 super().__init__()
@@ -172,6 +174,27 @@ implementation:
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
+
+          # === Wrapper expected by trainer ===
+        
+        class Gemma3Model(TinyGPTNeoX):
+            """
+            Compatibility wrapper so trainer components looking for 'Gemma3Model'
+            can load this model without modification.
+            """
+            def forward(self, input_ids, labels=None):
+                logits, _ = super().forward(input_ids)
+                loss = None
+                if labels is not None:
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                return (logits, loss)
+
         '''
 
         def write_text(path, text):
