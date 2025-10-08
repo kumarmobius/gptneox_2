@@ -1,4 +1,4 @@
-name: GPTNeoX model
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -151,34 +151,45 @@ implementation:
                     self.register_buffer("cos_cache", cos, persistent=False)
                 else:
                     self.sin_cache = self.cos_cache = None
-
             def forward(self, input_ids, past_kvs=None):
                 B, T = input_ids.shape
                 device = input_ids.device
                 x = self.emb(input_ids)
-                if past_kvs is not None and isinstance(past_kvs, (list, tuple)) and len(past_kvs) > 0 and isinstance(past_kvs[0], (list, tuple)) and len(past_kvs[0]) > 0:
+            
+                # determine past length
+                if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0][0] is not None:
                     past_len = past_kvs[0][0].size(2) if past_kvs[0][0].dim() >= 3 else 0
                 else:
                     past_len = 0
+            
+                # rotary embeddings
                 if self.sin_cache is not None:
                     sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
                     cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
                 else:
                     sin = cos = None
+            
                 new_kvs = []
                 for i, block in enumerate(self.blocks):
+                    # get safe past_kv
                     if past_kvs is not None and i < len(past_kvs):
-                        past_kv = past_kvs[i]
-                        # ensure it's a tuple of two tensors, even if None
-                        if past_kv is None or not (isinstance(past_kv, (tuple, list)) and len(past_kv) == 2):
-                            past_kv = (None, None)
+                        pkv = past_kvs[i]
+                        k = pkv[0] if (pkv[0] is not None) else torch.zeros(0, device=device, dtype=x.dtype)
+                        v = pkv[1] if (pkv[1] is not None) else torch.zeros(0, device=device, dtype=x.dtype)
+                        past_kv = (k, v)
                     else:
-                        past_kv = (None, None)
+                        past_kv = (torch.zeros(0, device=device, dtype=x.dtype),
+                                   torch.zeros(0, device=device, dtype=x.dtype))
+            
                     x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
-                    # always ensure present_kv is a tuple of two tensors
-                    if not isinstance(present_kv, (tuple, list)) or len(present_kv) != 2:
-                        present_kv = (present_kv, present_kv)
+            
+                    # ensure present_kv is tuple of two tensors
+                    if present_kv is None or not (isinstance(present_kv, (tuple, list)) and len(present_kv) == 2):
+                        present_kv = (torch.zeros(0, device=device, dtype=x.dtype),
+                                      torch.zeros(0, device=device, dtype=x.dtype))
+            
                     new_kvs.append(present_kv)
+            
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
