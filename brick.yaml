@@ -1,4 +1,4 @@
-name: GPTNeoXX
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -21,7 +21,7 @@ implementation:
       - -u
       - -c
       - |
-        import subprocess, sys, os, json, argparse, importlib.util, textwrap
+        import subprocess, sys, os, json, argparse, importlib.util, shutil
         # Install runtime deps (quiet)
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo", "numpy"], check=True)
         from torchinfo import summary
@@ -169,20 +169,9 @@ implementation:
                 return logits, new_kvs
         '''
 
-        def write_output(path, value, mode="w"):
-            try:
-                output_dir = os.path.dirname(path)
-                if output_dir:
-                    os.makedirs(output_dir, exist_ok=True)
-                with open(path, mode, encoding="utf-8") as f:
-                    if isinstance(value, (dict, list)):
-                        json.dump(value, f, indent=2)
-                    else:
-                        f.write(str(value))
-                print(f"[INFO] Successfully wrote to {path}")
-            except Exception as e:
-                print(f"[ERROR] Failed to write to {path}: {e}")
-                sys.exit(1)
+        def safe_make_dirs(path):
+            if path:
+                os.makedirs(path, exist_ok=True)
 
         def main():
             ap = argparse.ArgumentParser()
@@ -194,34 +183,44 @@ implementation:
             args = ap.parse_args()
 
             # ------------------------------
-            # Write the reusable model source file (user-requested snippet)
+            # 1) Write the model_py artifact at the exact path provided (so KFP captures it)
+            # 2) Also create a companion .py file (args.model_py + '.py') and import from that
             # ------------------------------
             try:
-                os.makedirs(os.path.dirname(args.model_py) or ".", exist_ok=True)
+                # ensure parent dir exists for the artifact path
+                safe_make_dirs(os.path.dirname(args.model_py) or ".")
                 with open(args.model_py, "w", encoding="utf-8") as f:
                     f.write(MODEL_PY)
-                print(f"[INFO] Model code saved to {args.model_py}")
+                print(f"[INFO] Model artifact saved to {args.model_py}")
+
+                # create a companion .py file for reliable import by importlib
+                companion_py = args.model_py if args.model_py.endswith(".py") else args.model_py + ".py"
+                safe_make_dirs(os.path.dirname(companion_py) or ".")
+                # write the same content (overwrite if same as artifact)
+                with open(companion_py, "w", encoding="utf-8") as f:
+                    f.write(MODEL_PY)
+                model_py_import_path = os.path.abspath(companion_py)
+                print(f"[INFO] Companion model source for import: {model_py_import_path}")
             except Exception as e:
-                print(f"[ERROR] Failed to write model_py to {args.model_py}: {e}")
+                print(f"[ERROR] Failed to write model source files: {e}")
                 sys.exit(1)
 
-            # Import the model with absolute path
-            print("[INFO] Loading model module...")
-            model_py_abs = os.path.abspath(args.model_py)
-            spec = importlib.util.spec_from_file_location("tinygpt_neox_model", model_py_abs)
-            if spec is None:
-                print(f"[ERROR] Could not create module spec from {model_py_abs}")
+            # Import the model module from the companion .py
+            try:
+                spec = importlib.util.spec_from_file_location("tinygpt_neox_model", model_py_import_path)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"spec creation failed for {model_py_import_path}")
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["tinygpt_neox_model"] = mod
+                spec.loader.exec_module(mod)
+                print("[INFO] Model module loaded successfully")
+            except Exception as e:
+                print(f"[ERROR] Could not load model module from {model_py_import_path}: {e}")
                 sys.exit(1)
-            if spec.loader is None:
-                print(f"[ERROR] Module spec has no loader for {model_py_abs}")
-                sys.exit(1)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["tinygpt_neox_model"] = mod
-            spec.loader.exec_module(mod)
-            print("[INFO] Model module loaded successfully")
 
             # === Build Config from tokenizer ===
             try:
+                safe_make_dirs(os.path.dirname(args.tokenizer_json) or ".")
                 tok = Tokenizer.from_file(args.tokenizer_json)
                 vocab_size = tok.get_vocab_size()
             except Exception as e:
@@ -254,19 +253,18 @@ implementation:
             model.eval()
             print("[INFO] Model initialized")
 
-            # Print model summary
+            # Print model summary (best-effort)
             print("[INFO] Model summary:")
             try:
-                vocab_sz = CONFIG["vocab_size"]
-                summary(model, input_data=torch.randint(0, vocab_sz, (1, 32)).to(device))
+                summary(model, input_data=torch.randint(0, CONFIG["vocab_size"], (1, 32)).to(device))
             except Exception as e:
                 print(f"[WARN] Could not run summary: {e}")
 
             # ------------------------------
-            # Save weights (code 1)
+            # Save weights (code 1) — ensure parent exists
             # ------------------------------
             try:
-                os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
+                safe_make_dirs(os.path.dirname(args.model_weights) or ".")
                 torch.save(model.state_dict(), args.model_weights)
                 print(f"[INFO] Weights saved to {args.model_weights}")
             except Exception as e:
@@ -274,12 +272,12 @@ implementation:
                 sys.exit(1)
 
             # ------------------------------
-            # Save config (code 2)
+            # Save config (code 2) — ensure parent exists
             # ------------------------------
             try:
                 dtype_name = "float16" if model_dtype == torch.float16 else "float32"
                 cfg_to_save = dict(CONFIG, dtype=dtype_name)
-                os.makedirs(os.path.dirname(args.model_config) or ".", exist_ok=True)
+                safe_make_dirs(os.path.dirname(args.model_config) or ".")
                 with open(args.model_config, "w", encoding="utf-8") as f:
                     json.dump(cfg_to_save, f, indent=2)
                 print(f"[INFO] Model config saved to {args.model_config}")
@@ -288,7 +286,10 @@ implementation:
                 sys.exit(1)
 
             # Final info
-            n_params = sum(p.numel() for p in model.parameters())
+            try:
+                n_params = sum(p.numel() for p in model.parameters())
+            except Exception:
+                n_params = 0
             num_layers = CONFIG.get("num_layers", 0)
             print(f"[INFO] Total parameters: {n_params:,}")
             print(f"[INFO] Number of layers: {num_layers}")
