@@ -1,4 +1,4 @@
-name: GPTNeoX model
+name: GPTNeoX Model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -351,12 +351,34 @@ implementation:
                 cfg_to_save["qk_norm"] = bool(cfg_to_save.get("qk_norm", True))
 
                 # core architecture fields (ensure ints)
-                cfg_to_save["vocab_size"] = int(cfg_to_save.get("vocab_size", cfg_to_save.get("vocab", vocab_size)))
+                # cfg_to_save["vocab_size"] = int(cfg_to_save.get("vocab_size", cfg_to_save.get("vocab", vocab_size)))
                 cfg_to_save["emb_dim"] = int(cfg_to_save.get("emb_dim", cfg_to_save.get("d_model", 256)))
                 cfg_to_save["num_heads"] = int(cfg_to_save.get("num_heads", cfg_to_save.get("n_heads", 8)))
                 cfg_to_save["head_dim"] = int(cfg_to_save.get("head_dim", max(1, cfg_to_save["emb_dim"] // cfg_to_save["num_heads"])))
-                cfg_to_save["hidden_dim"] = int(cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * int(cfg_to_save.get("ff_mult", 4))))
-                cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // max(1, cfg_to_save["emb_dim"]))))
+                # cfg_to_save["hidden_dim"] = int(cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * int(cfg_to_save.get("ff_mult", 4))))
+                # cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // max(1, cfg_to_save["emb_dim"]))))
+
+                # Ensure emb_dim is int
+                emb_dim = cfg_to_save.get("emb_dim", 256)
+                if isinstance(emb_dim, list):
+                    emb_dim = emb_dim[0]  # take first element if list
+                cfg_to_save["emb_dim"] = int(emb_dim)
+                
+                # Ensure ff_mult is int
+                ff_mult = cfg_to_save.get("ff_mult", 4)
+                if isinstance(ff_mult, list):
+                    ff_mult = ff_mult[0]
+                cfg_to_save["ff_mult"] = int(ff_mult)
+                
+                # Ensure hidden_dim is int
+                hidden_dim = cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * cfg_to_save["ff_mult"])
+                if isinstance(hidden_dim, list):
+                    hidden_dim = hidden_dim[0]
+                cfg_to_save["hidden_dim"] = int(hidden_dim)
+                
+                # Now safe to compute ff_mult if missing
+                cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // cfg_to_save["emb_dim"])))
+
 
                 # add param counts for debugging
                 try:
