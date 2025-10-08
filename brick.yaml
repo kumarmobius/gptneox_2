@@ -1,4 +1,4 @@
-name: GPTNeoX
+name: GPTNeoX model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -79,10 +79,12 @@ implementation:
                     q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin, cos)
                     q = torch.cat((q_rot, q_pass), dim=-1)
                     k = torch.cat((k_rot, k_pass), dim=-1)
-                if past_kv is not None:
+                if past_kv is not None and isinstance(past_kv, (list, tuple)) and len(past_kv) == 2:
                     past_k, past_v = past_kv
                     k = torch.cat([past_k, k], dim=2)
                     v = torch.cat([past_v, v], dim=2)
+                else:
+                    past_k, past_v = None, None
                 present_kv = (k, v)
                 scale = 1.0 / math.sqrt(self.head_dim)
                 attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
