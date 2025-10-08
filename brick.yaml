@@ -1,5 +1,5 @@
-name: GPTNeoX model
-description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
+name: GPTNeoX
+description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source (trainer-compatible).
 inputs:
   - name: tokenizer_json
     type: Model
@@ -21,14 +21,15 @@ implementation:
       - -u
       - -c
       - |
-        import subprocess, sys, os, json, argparse, textwrap
+        import subprocess, sys, os, json, argparse, importlib.util, textwrap
         # Install runtime deps (quiet)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo", "numpy"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+                        "torch", "tokenizers", "torchinfo", "numpy"], check=True)
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
 
-        # === embedded model source (will be written to model_py at runtime) ===
+        # === Embedded model source. Includes TinyGPTNeoX and adapter Gemma3Model ===
         MODEL_PY = '''
         import math
         import torch
@@ -126,16 +127,16 @@ implementation:
         class TinyGPTNeoX(nn.Module):
             def __init__(self, cfg):
                 super().__init__()
-                vocab_size, emb_dim = cfg["vocab_size"], cfg["emb_dim"]
-                num_layers = cfg.get("num_layers", 4)
-                num_heads = cfg.get("num_heads", 8)
-                rotary_pct = cfg.get("rotary_pct", 0.25)
+                vocab_size, emb_dim = int(cfg["vocab_size"]), int(cfg["emb_dim"])
+                num_layers = int(cfg.get("num_layers", cfg.get("n_layers", 4)))
+                num_heads = int(cfg.get("num_heads", cfg.get("n_heads", 8)))
+                rotary_pct = float(cfg.get("rotary_pct", 0.25))
                 self.emb = nn.Embedding(vocab_size, emb_dim)
-                self.pos_max = cfg.get("max_seq_len", 512)
+                self.pos_max = int(cfg.get("max_seq_len", cfg.get("context_length", 512)))
                 self.blocks = nn.ModuleList([
                     NeoXBlock(emb_dim, num_heads, rotary_pct,
-                              ff_mult=cfg.get("ff_mult", 4),
-                              dropout=cfg.get("dropout", 0.0))
+                              ff_mult=int(cfg.get("ff_mult", 4)),
+                              dropout=float(cfg.get("dropout", 0.0)))
                     for _ in range(num_layers)
                 ])
                 self.final_ln = nn.LayerNorm(emb_dim)
@@ -167,11 +168,36 @@ implementation:
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
+
+        # Thin adapter so trainer can import Gemma3Model(cfg)
+        class Gemma3Model(TinyGPTNeoX):
+            """
+            Adapter mapping common Gemma3 config keys to TinyGPTNeoX expected keys.
+            """
+            def __init__(self, cfg):
+                cfg2 = dict(cfg)  # shallow copy
+                # normalize common alternate key names
+                cfg2["num_layers"] = int(cfg.get("n_layers", cfg.get("num_layers", 4)))
+                cfg2["num_heads"] = int(cfg.get("n_heads", cfg.get("num_heads", 8)))
+                cfg2["emb_dim"] = int(cfg.get("emb_dim", cfg.get("emb_dim", 256)))
+                cfg2["vocab_size"] = int(cfg.get("vocab_size", cfg.get("vocab_size")))
+                cfg2["max_seq_len"] = int(cfg.get("context_length", cfg.get("max_seq_len", 512)))
+                # ff_mult fallback from hidden_dim
+                if "ff_mult" not in cfg2:
+                    if "hidden_dim" in cfg2 and cfg2.get("emb_dim"):
+                        try:
+                            cfg2["ff_mult"] = max(1, int(cfg2["hidden_dim"] // cfg2["emb_dim"]))
+                        except Exception:
+                            cfg2["ff_mult"] = 4
+                    else:
+                        cfg2["ff_mult"] = int(cfg.get("ff_mult", 4))
+                cfg2.setdefault("dropout", float(cfg.get("dropout", 0.0)))
+                super().__init__(cfg2)
         '''
 
-        def safe_make_dirs(path):
-            if path:
-                os.makedirs(path, exist_ok=True)
+        def safe_make_dirs(p):
+            if p:
+                os.makedirs(p, exist_ok=True)
 
         def main():
             ap = argparse.ArgumentParser()
@@ -182,7 +208,52 @@ implementation:
             ap.add_argument("--model_py", required=True)
             args = ap.parse_args()
 
-            # --- write model_py artifact (so KFP can capture it) ---
+            # load tokenizer and build base CONFIG
+            try:
+                tok = Tokenizer.from_file(args.tokenizer_json)
+                vocab_size = tok.get_vocab_size()
+            except Exception as e:
+                print(f"[ERROR] Failed to load tokenizer: {e}")
+                sys.exit(1)
+
+            # Base config - you can tweak these defaults as desired
+            CONFIG = {
+                "vocab_size": int(vocab_size),
+                "emb_dim": 256,
+                "num_layers": int(args.num_layers),
+                "num_heads": 8,
+                "max_seq_len": 512,   # default seq len used in TinyGPTNeoX if not overridden
+                "ff_mult": 4,
+                "dropout": 0.0,
+            }
+
+            # Device and dtype
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_dtype = torch.float16 if device == "cuda" else torch.float32
+
+            # Trainer-required defaults - ensure keys exist
+            trainer_defaults = {
+                "context_length": int(CONFIG.get("max_seq_len", 2048)),
+                "sliding_window": int(min(512, CONFIG.get("max_seq_len", 2048))),
+                "emb_dim": int(CONFIG.get("emb_dim", 256)),
+                "n_heads": int(CONFIG.get("num_heads", 8)),
+                "n_layers": int(CONFIG.get("num_layers", 4)),
+                "head_dim": int(CONFIG.get("head_dim") or (int(CONFIG.get("emb_dim", 256)) // max(1, int(CONFIG.get("num_heads", 8))))),
+                "hidden_dim": int(CONFIG.get("hidden_dim") or int(CONFIG.get("emb_dim", 256) * 4)),
+                "rope_base": float(CONFIG.get("rope_base", 1000000.0)),
+                "rope_local_base": float(CONFIG.get("rope_local_base", 10000.0)),
+                "n_kv_groups": int(CONFIG.get("n_kv_groups", 1)),
+                "qk_norm": bool(CONFIG.get("qk_norm", True)),
+                "layer_types": CONFIG.get("layer_types", ["full_attention"] * int(CONFIG.get("num_layers", 4))),
+            }
+
+            # merge (trainer defaults first, then CONFIG to let explicit CONFIG override defaults)
+            merged_cfg = {**trainer_defaults, **CONFIG}
+            # ensure dtype string for saved config
+            dtype_name = "float16" if model_dtype == torch.float16 else "float32"
+            merged_cfg["dtype"] = dtype_name
+
+            # --- Write model_py artifact (so KFP captures it) ---
             try:
                 safe_make_dirs(os.path.dirname(args.model_py) or ".")
                 with open(args.model_py, "w", encoding="utf-8") as f:
@@ -192,7 +263,7 @@ implementation:
                 print(f"[ERROR] Failed to write model_py to {args.model_py}: {e}")
                 sys.exit(1)
 
-            # --- load model definitions into this process (avoid importlib issues) ---
+            # Load model into this process (so we can save weights) by executing the source
             try:
                 exec(MODEL_PY, globals())
                 print("[INFO] Executed MODEL_PY into current namespace")
@@ -200,31 +271,9 @@ implementation:
                 print(f"[ERROR] exec(MODEL_PY) failed: {e}")
                 sys.exit(1)
 
-            # --- build CONFIG from tokenizer ---
+            # Initialize the model instance (TinyGPTNeoX is defined in MODEL_PY)
             try:
-                tok = Tokenizer.from_file(args.tokenizer_json)
-                vocab_size = tok.get_vocab_size()
-            except Exception as e:
-                print(f"[ERROR] Failed to load tokenizer: {e}")
-                sys.exit(1)
-
-            CONFIG = {
-                "vocab_size": vocab_size,
-                "emb_dim": 256,
-                "num_layers": args.num_layers,
-                "num_heads": 8,
-                "max_seq_len": 512,
-                "ff_mult": 4,
-                "dropout": 0.0,
-            }
-
-            # device + dtype selection
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model_dtype = torch.float16 if device == "cuda" else torch.float32
-
-            # Initialize model (TinyGPTNeoX should be defined by exec above)
-            try:
-                model = globals()["TinyGPTNeoX"](CONFIG).to(device)
+                model = globals()["TinyGPTNeoX"](merged_cfg).to(device)
             except Exception as e:
                 print(f"[ERROR] Failed to initialize TinyGPTNeoX: {e}")
                 sys.exit(1)
@@ -236,13 +285,11 @@ implementation:
 
             # Model summary (best-effort)
             try:
-                summary(model, input_data=torch.randint(0, CONFIG["vocab_size"], (1, 32)).to(device))
+                summary(model, input_data=torch.randint(0, merged_cfg["vocab_size"], (1, 32)).to(device))
             except Exception as e:
                 print(f"[WARN] Could not run torchinfo.summary: {e}")
 
-            # ------------------------------
-            # Save weights (user code 1)
-            # ------------------------------
+            # Save weights (user snippet)
             try:
                 safe_make_dirs(os.path.dirname(args.model_weights) or ".")
                 torch.save(model.state_dict(), args.model_weights)
@@ -251,12 +298,11 @@ implementation:
                 print(f"[ERROR] Failed to save weights to {args.model_weights}: {e}")
                 sys.exit(1)
 
-            # ------------------------------
-            # Save config (user code 2)
-            # ------------------------------
+            # Save config file (trainer-compatible)
             try:
-                dtype_name = "float16" if model_dtype == torch.float16 else "float32"
-                cfg_to_save = dict(CONFIG, dtype=dtype_name)
+                cfg_to_save = dict(merged_cfg)
+                # Save dtype as string for trainer compatibility
+                cfg_to_save["dtype"] = dtype_name
                 safe_make_dirs(os.path.dirname(args.model_config) or ".")
                 with open(args.model_config, "w", encoding="utf-8") as f:
                     json.dump(cfg_to_save, f, indent=2)
@@ -265,7 +311,7 @@ implementation:
                 print(f"[ERROR] Failed to save model config to {args.model_config}: {e}")
                 sys.exit(1)
 
-            # Final info
+            # Print final param count
             try:
                 n_params = sum(p.numel() for p in model.parameters())
             except Exception:
