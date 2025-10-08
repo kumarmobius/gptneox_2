@@ -175,8 +175,6 @@ implementation:
                 logits = self.head(x)
                 return logits, new_kvs
 
-          # === Wrapper expected by trainer ===
-        
         class Gemma3Model(TinyGPTNeoX):
             """
             Compatibility wrapper so trainer components looking for 'Gemma3Model'
