@@ -1,4 +1,4 @@
-name: GPTNeoX
+name: GPTNeoX model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -151,48 +151,64 @@ implementation:
                     self.register_buffer("cos_cache", cos, persistent=False)
                 else:
                     self.sin_cache = self.cos_cache = None
+      
             def forward(self, input_ids, past_kvs=None):
                 B, T = input_ids.shape
                 device = input_ids.device
                 x = self.emb(input_ids)
             
-                # determine past length
-                if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0][0] is not None:
-                    past_len = past_kvs[0][0].size(2) if past_kvs[0][0].dim() >= 3 else 0
-                else:
-                    past_len = 0
+                # Determine past length safely
+                past_len = 0
+                if past_kvs is not None:
+                    for pkv in past_kvs:
+                        if pkv is not None and isinstance(pkv, (tuple, list)) and len(pkv) == 2 and pkv[0] is not None:
+                            past_len = pkv[0].size(2) if pkv[0].dim() >= 3 else 0
+                            break
             
-                # rotary embeddings
+                # Rotary embeddings
                 if self.sin_cache is not None:
-                    sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
-                    cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
+                    pos_max = self.sin_cache.size(0)
+                    start = min(past_len, pos_max)
+                    end = min(past_len + T, pos_max)
+                    sin = self.sin_cache[start:end].to(x.device).to(x.dtype)
+                    cos = self.cos_cache[start:end].to(x.device).to(x.dtype)
                 else:
                     sin = cos = None
             
                 new_kvs = []
                 for i, block in enumerate(self.blocks):
-                    # get safe past_kv
+                    # Safe past_kv
                     if past_kvs is not None and i < len(past_kvs):
                         pkv = past_kvs[i]
-                        k = pkv[0] if (pkv[0] is not None) else torch.zeros(0, device=device, dtype=x.dtype)
-                        v = pkv[1] if (pkv[1] is not None) else torch.zeros(0, device=device, dtype=x.dtype)
+                        if pkv is None or not (isinstance(pkv, (tuple, list)) and len(pkv) == 2):
+                            k = torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
+                            v = torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
+                        else:
+                            k = pkv[0] if pkv[0] is not None else torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
+                            v = pkv[1] if pkv[1] is not None else torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
                         past_kv = (k, v)
                     else:
-                        past_kv = (torch.zeros(0, device=device, dtype=x.dtype),
-                                   torch.zeros(0, device=device, dtype=x.dtype))
+                        past_kv = (
+                            torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype),
+                            torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
+                        )
             
+                    # Forward through block
                     x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
             
-                    # ensure present_kv is tuple of two tensors
+                    # Ensure present_kv is always a tuple of two tensors
                     if present_kv is None or not (isinstance(present_kv, (tuple, list)) and len(present_kv) == 2):
-                        present_kv = (torch.zeros(0, device=device, dtype=x.dtype),
-                                      torch.zeros(0, device=device, dtype=x.dtype))
+                        present_kv = (
+                            torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype),
+                            torch.zeros(B, block.attn.num_heads, 0, block.attn.head_dim, device=device, dtype=x.dtype)
+                        )
             
                     new_kvs.append(present_kv)
             
                 x = self.final_ln(x)
                 logits = self.head(x)
                 return logits, new_kvs
+
 
         # Thin adapter so trainers expecting Gemma3Model can import it
         class Gemma3Model(TinyGPTNeoX):
