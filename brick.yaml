@@ -1,4 +1,4 @@
-name: GPTNeoX implemented
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -317,12 +317,11 @@ implementation:
             # Save config (robust for brick2 expectations)
             # ------------------------------
             # ------------------------------
-              
             try:
                 # dtype name for trainer compatibility
                 dtype_name = "float16" if model_dtype == torch.float16 else "float32"
             
-                # Start from CONFIG and normalize/ensure keys brick2 expects
+                # Start from CONFIG and normalize/ensure keys Brick2 expects
                 cfg_to_save = dict(CONFIG) if isinstance(CONFIG, dict) else {}
                 cfg_to_save["dtype"] = dtype_name
             
@@ -335,7 +334,7 @@ implementation:
                 # ensure max_seq_len is present too
                 cfg_to_save["max_seq_len"] = int(cfg_to_save.get("max_seq_len", cfg_to_save["context_length"]))
             
-                # sliding_window default used by brick2
+                # sliding_window default used by Brick2
                 cfg_to_save["sliding_window"] = int(cfg_to_save.get("sliding_window",
                                                     min(512, cfg_to_save["max_seq_len"])))
             
@@ -353,36 +352,17 @@ implementation:
                 cfg_to_save["n_kv_groups"] = int(cfg_to_save.get("n_kv_groups", 1))
                 cfg_to_save["qk_norm"] = bool(cfg_to_save.get("qk_norm", True))
             
-                # --- core architecture fields ---
-                # Ensure emb_dim is int
-                emb_dim = cfg_to_save.get("emb_dim", 256)
-                if isinstance(emb_dim, list):
-                    emb_dim = emb_dim[0]
-                cfg_to_save["emb_dim"] = int(emb_dim)
+                # --- core architecture fields (Gemma-style safe) ---
+                for key in ["emb_dim", "num_heads", "hidden_dim", "ff_mult"]:
+                    val = cfg_to_save.get(key)
+                    if isinstance(val, list):
+                        val = val[0]  # take first element if list
+                    cfg_to_save[key] = int(val)
             
-                # Ensure num_heads is int
-                num_heads = cfg_to_save.get("num_heads", 8)
-                if isinstance(num_heads, list):
-                    num_heads = num_heads[0]
-                cfg_to_save["num_heads"] = int(num_heads)
-            
-                # Compute head_dim safely
+                # Compute derived values safely
                 cfg_to_save["head_dim"] = max(1, cfg_to_save["emb_dim"] // cfg_to_save["num_heads"])
-            
-                # Ensure ff_mult is int
-                ff_mult = cfg_to_save.get("ff_mult", 4)
-                if isinstance(ff_mult, list):
-                    ff_mult = ff_mult[0]
-                cfg_to_save["ff_mult"] = int(ff_mult)
-            
-                # Ensure hidden_dim is int
-                hidden_dim = cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * cfg_to_save["ff_mult"])
-                if isinstance(hidden_dim, list):
-                    hidden_dim = hidden_dim[0]
-                cfg_to_save["hidden_dim"] = int(hidden_dim)
-            
-                # Recompute ff_mult safely if missing
-                cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // cfg_to_save["emb_dim"])))
+                cfg_to_save["hidden_dim"] = cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * cfg_to_save.get("ff_mult", 4))
+                cfg_to_save["ff_mult"] = cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // cfg_to_save["emb_dim"]))
             
                 # Add param counts for debugging
                 try:
@@ -406,10 +386,12 @@ implementation:
                     json.dump(cfg_to_save, f, indent=2)
             
                 print(f"[INFO] Model config saved to {args.model_config}")
+            
             except Exception as e:
                 print(f"[ERROR] Failed to save model config to {args.model_config}: {e}")
                 sys.exit(1)
-
+            
+                         
 
             # Final info
             try:
