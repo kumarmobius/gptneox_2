@@ -167,8 +167,17 @@ implementation:
                     sin = cos = None
                 new_kvs = []
                 for i, block in enumerate(self.blocks):
-                    past_kv = past_kvs[i] if past_kvs is not None else None
+                    if past_kvs is not None and i < len(past_kvs):
+                        past_kv = past_kvs[i]
+                        # ensure it's a tuple of two tensors, even if None
+                        if past_kv is None or not (isinstance(past_kv, (tuple, list)) and len(past_kv) == 2):
+                            past_kv = (None, None)
+                    else:
+                        past_kv = (None, None)
                     x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
+                    # always ensure present_kv is a tuple of two tensors
+                    if not isinstance(present_kv, (tuple, list)) or len(present_kv) != 2:
+                        present_kv = (present_kv, present_kv)
                     new_kvs.append(present_kv)
                 x = self.final_ln(x)
                 logits = self.head(x)
