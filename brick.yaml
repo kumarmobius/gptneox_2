@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoXX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -193,46 +193,62 @@ implementation:
             ap.add_argument("--model_py", required=True)
             args = ap.parse_args()
 
-            # Ensure model_py path is correct and directory exists
-            model_py_abs = os.path.abspath(args.model_py)
-            print(f"[INFO] Model path (absolute): {model_py_abs}")
-
-            # Ensure the directory exists before writing the model source code
-            os.makedirs(os.path.dirname(model_py_abs), exist_ok=True)
-
+            # ------------------------------
+            # Write the reusable model source file (user-requested snippet)
+            # ------------------------------
             try:
-                with open(model_py_abs, "w", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(args.model_py) or ".", exist_ok=True)
+                with open(args.model_py, "w", encoding="utf-8") as f:
                     f.write(MODEL_PY)
-                print(f"[INFO] Model source saved to {model_py_abs}")
+                print(f"[INFO] Model code saved to {args.model_py}")
             except Exception as e:
-                print(f"[ERROR] Failed to write to {model_py_abs}: {e}")
-                sys.exit(1)
-
-            # Verify model file was created
-            if not os.path.exists(model_py_abs):
-                print(f"[ERROR] Model Python file not found at {model_py_abs}")
+                print(f"[ERROR] Failed to write model_py to {args.model_py}: {e}")
                 sys.exit(1)
 
             # Import the model with absolute path
             print("[INFO] Loading model module...")
-            
+            model_py_abs = os.path.abspath(args.model_py)
             spec = importlib.util.spec_from_file_location("tinygpt_neox_model", model_py_abs)
             if spec is None:
                 print(f"[ERROR] Could not create module spec from {model_py_abs}")
                 sys.exit(1)
-            
             if spec.loader is None:
                 print(f"[ERROR] Module spec has no loader for {model_py_abs}")
                 sys.exit(1)
-            
             mod = importlib.util.module_from_spec(spec)
             sys.modules["tinygpt_neox_model"] = mod
             spec.loader.exec_module(mod)
             print("[INFO] Model module loaded successfully")
 
-            # Create model
+            # === Build Config from tokenizer ===
+            try:
+                tok = Tokenizer.from_file(args.tokenizer_json)
+                vocab_size = tok.get_vocab_size()
+            except Exception as e:
+                print(f"[ERROR] Failed to load tokenizer: {e}")
+                sys.exit(1)
+
+            CONFIG = {
+                "vocab_size": vocab_size,
+                "emb_dim": 256,
+                "num_layers": args.num_layers,
+                "num_heads": 8,
+                "max_seq_len": 512,
+                "ff_mult": 4,
+                "dropout": 0.0,
+            }
+
+            device = torch.device("cpu")
+            model_dtype = torch.float32
+
+            # === Initialize model ===
             print("[INFO] Initializing model...")
-            model = mod.TinyGPTNeoX(CONFIG).to(device)
+            try:
+                model = mod.TinyGPTNeoX(CONFIG).to(device)
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize model: {e}")
+                sys.exit(1)
+
             if model_dtype == torch.float16:
                 model.half()
             model.eval()
@@ -240,20 +256,40 @@ implementation:
 
             # Print model summary
             print("[INFO] Model summary:")
-            vocab_sz = CONFIG["vocab_size"]
-            summary(model, input_data=torch.randint(0, vocab_sz, (1, 32)).to(device))
+            try:
+                vocab_sz = CONFIG["vocab_size"]
+                summary(model, input_data=torch.randint(0, vocab_sz, (1, 32)).to(device))
+            except Exception as e:
+                print(f"[WARN] Could not run summary: {e}")
 
-            # Save model weights
-            print("[INFO] Saving model weights...")
-            output_dir = os.path.dirname(args.model_weights)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            torch.save(model.state_dict(), args.model_weights)
-            print(f"[INFO] Weights saved to {args.model_weights}")
+            # ------------------------------
+            # Save weights (code 1)
+            # ------------------------------
+            try:
+                os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
+                torch.save(model.state_dict(), args.model_weights)
+                print(f"[INFO] Weights saved to {args.model_weights}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save weights to {args.model_weights}: {e}")
+                sys.exit(1)
 
-            # Calculate and print parameters
+            # ------------------------------
+            # Save config (code 2)
+            # ------------------------------
+            try:
+                dtype_name = "float16" if model_dtype == torch.float16 else "float32"
+                cfg_to_save = dict(CONFIG, dtype=dtype_name)
+                os.makedirs(os.path.dirname(args.model_config) or ".", exist_ok=True)
+                with open(args.model_config, "w", encoding="utf-8") as f:
+                    json.dump(cfg_to_save, f, indent=2)
+                print(f"[INFO] Model config saved to {args.model_config}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save model config to {args.model_config}: {e}")
+                sys.exit(1)
+
+            # Final info
             n_params = sum(p.numel() for p in model.parameters())
-            num_layers = CONFIG["num_layers"]
+            num_layers = CONFIG.get("num_layers", 0)
             print(f"[INFO] Total parameters: {n_params:,}")
             print(f"[INFO] Number of layers: {num_layers}")
             print("[INFO] Model creation completed successfully!")
