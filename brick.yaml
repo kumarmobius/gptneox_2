@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoX
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -154,7 +154,10 @@ implementation:
                 B, T = input_ids.shape
                 device = input_ids.device
                 x = self.emb(input_ids)
-                past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
+                if past_kvs is not None and isinstance(past_kvs, (list, tuple)) and len(past_kvs) > 0 and isinstance(past_kvs[0], (list, tuple)) and len(past_kvs[0]) > 0:
+                    past_len = past_kvs[0][0].size(2) if past_kvs[0][0].dim() >= 3 else 0
+                else:
+                    past_len = 0
                 if self.sin_cache is not None:
                     sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
                     cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
