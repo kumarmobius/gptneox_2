@@ -1,13 +1,11 @@
-name: GPTNeoX
-description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, then saves initial weights, JSON config, and model source.
-
+name: GPTNeoX model
+description: Builds an untrained TinyGPTNeoX model (trainer-compatible). Writes model_py, model_config and model_weights.
 inputs:
   - name: tokenizer_json
-    type: Data
+    type: Model
   - name: num_layers
     type: Integer
-    default: 4
-
+    default: "4"
 outputs:
   - name: model_weights
     type: Model
@@ -15,172 +13,223 @@ outputs:
     type: Data
   - name: model_py
     type: Data
-
 implementation:
   container:
-    image: pytorch/pytorch:1.12.1-cpu
+    image: python:3.9
     command:
-      - sh
-      - -c
-      - |
-        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-cache-dir tokenizers || \
-        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-cache-dir tokenizers --user
-        exec "$0" "$@"
       - python3
       - -u
       - -c
       - |
-        import os, sys, json, argparse, importlib.util, textwrap
+        # export-safe: model source lines (no nested triple-quote)
+        import subprocess, sys, os, json, argparse, textwrap
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+                        "torch", "tokenizers", "torchinfo", "numpy"], check=True)
+        from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
 
-        # === embedded model source (written to model_py at runtime) ===
-        MODEL_PY = r'''
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+        MODEL_PY_LINES = [
+          "import math",
+          "import torch",
+          "import torch.nn as nn",
+          "import torch.nn.functional as F",
+          "",
+          "def rotate_half(x):",
+          "    x1 = x[..., ::2]",
+          "    x2 = x[..., 1::2]",
+          "    return torch.stack((-x2, x1), dim=-1).reshape_as(x)",
+          "",
+          "def apply_rotary_pos_emb(q, k, sin, cos):",
+          "    q_rot = (q * cos) + (rotate_half(q) * sin)",
+          "    k_rot = (k * cos) + (rotate_half(k) * sin)",
+          "    return q_rot, k_rot",
+          "",
+          "def make_rotary_sin_cos(seq_len, rotary_dim, device, dtype=torch.float32):",
+          "    inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device=device, dtype=dtype) / rotary_dim))",
+          "    positions = torch.arange(seq_len, device=device, dtype=dtype)",
+          "    freqs = torch.einsum('i,j->ij', positions, inv_freq)",
+          "    emb = torch.cat((freqs, freqs), dim=-1)",
+          "    return emb.sin(), emb.cos()",
+          "",
+          "class MaskedMultiHeadAttention(nn.Module):",
+          "    def __init__(self, emb_dim, num_heads, rotary_pct=0.25, dropout=0.0):",
+          "        super().__init__()",
+          "        assert emb_dim % num_heads == 0",
+          "        self.emb_dim = emb_dim",
+          "        self.num_heads = num_heads",
+          "        self.head_dim = emb_dim // num_heads",
+          "        self.rotary_pct = rotary_pct",
+          "        self.rotary_dim = int(self.head_dim * rotary_pct)",
+          "        if self.rotary_dim % 2 != 0:",
+          "            self.rotary_dim -= 1",
+          "        self.qkv_proj = nn.Linear(emb_dim, emb_dim * 3, bias=False)",
+          "        self.out_proj = nn.Linear(emb_dim, emb_dim, bias=False)",
+          "        self.dropout = nn.Dropout(dropout)",
+          "",
+          "    def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):",
+          "        B, T, E = x.shape",
+          "        qkv = self.qkv_proj(x).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)",
+          "        q, k, v = qkv[0], qkv[1], qkv[2]",
+          "        if self.rotary_dim > 0 and sin is not None and cos is not None:",
+          "            q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]",
+          "            k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]",
+          "            sin = sin.view(1, 1, T, self.rotary_dim)",
+          "            cos = cos.view(1, 1, T, self.rotary_dim)",
+          "            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin, cos)",
+          "            q = torch.cat((q_rot, q_pass), dim=-1)",
+          "            k = torch.cat((k_rot, k_pass), dim=-1)",
+          "        if past_kv is not None:",
+          "            past_k, past_v = past_kv",
+          "            k = torch.cat([past_k, k], dim=2)",
+          "            v = torch.cat([past_v, v], dim=2)",
+          "        present_kv = (k, v)",
+          "        scale = 1.0 / math.sqrt(self.head_dim)",
+          "        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale",
+          "        if attn_mask is None:",
+          "            q_len, k_len = q.size(2), k.size(2)",
+          "            mask = torch.ones((q_len, k_len), device=x.device, dtype=torch.bool).tril()",
+          "            attn_mask = mask.unsqueeze(0).unsqueeze(0)",
+          "        attn_scores = attn_scores.masked_fill(~attn_mask, float('-inf'))",
+          "        attn_probs = self.dropout(torch.softmax(attn_scores, dim=-1))",
+          "        out = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, E)",
+          "        return self.out_proj(out), present_kv",
+          "",
+          "class FeedForward(nn.Module):",
+          "    def __init__(self, emb_dim, ff_mult=4, dropout=0.0):",
+          "        super().__init__()",
+          "        self.fc1 = nn.Linear(emb_dim, emb_dim * ff_mult)",
+          "        self.act = nn.GELU()",
+          "        self.fc2 = nn.Linear(emb_dim * ff_mult, emb_dim)",
+          "        self.dropout = nn.Dropout(dropout)",
+          "    def forward(self, x):",
+          "        return self.dropout(self.fc2(self.act(self.fc1(x))))",
+          "",
+          "class NeoXBlock(nn.Module):",
+          "    def __init__(self, emb_dim, num_heads, rotary_pct=0.25, ff_mult=4, dropout=0.0):",
+          "        super().__init__()",
+          "        self.ln_attn = nn.LayerNorm(emb_dim)",
+          "        self.ln_ff = nn.LayerNorm(emb_dim)",
+          "        self.attn = MaskedMultiHeadAttention(emb_dim, num_heads, rotary_pct, dropout)",
+          "        self.ff = FeedForward(emb_dim, ff_mult, dropout)",
+          "    def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):",
+          "        norm_x = self.ln_attn(x)",
+          "        attn_out, present_kv = self.attn(norm_x, sin, cos, attn_mask, past_kv)",
+          "        x = x + attn_out",
+          "        norm_x = self.ln_ff(x)",
+          "        ff_out = self.ff(norm_x)",
+          "        x = x + ff_out",
+          "        return x, present_kv",
+          "",
+          "class TinyGPTNeoX(nn.Module):",
+          "    def __init__(self, cfg):",
+          "        super().__init__()",
+          "        vocab_size, emb_dim = int(cfg['vocab_size']), int(cfg['emb_dim'])",
+          "        num_layers = int(cfg.get('num_layers', cfg.get('n_layers', 4)))",
+          "        num_heads = int(cfg.get('num_heads', cfg.get('n_heads', 8)))",
+          "        rotary_pct = float(cfg.get('rotary_pct', 0.25))",
+          "        self.emb = nn.Embedding(vocab_size, emb_dim)",
+          "        self.pos_max = int(cfg.get('max_seq_len', cfg.get('context_length', 512)))",
+          "        self.blocks = nn.ModuleList([",
+          "            NeoXBlock(emb_dim, num_heads, rotary_pct, ff_mult=int(cfg.get('ff_mult', 4)), dropout=float(cfg.get('dropout', 0.0)))",
+          "            for _ in range(num_layers)",
+          "        ])",
+          "        self.final_ln = nn.LayerNorm(emb_dim)",
+          "        self.head = nn.Linear(emb_dim, vocab_size, bias=False)",
+          "        self.head.weight = self.emb.weight",
+          "        rotary_dim = self.blocks[0].attn.rotary_dim",
+          "        if rotary_dim > 0:",
+          "            sin, cos = make_rotary_sin_cos(self.pos_max, rotary_dim, device='cpu', dtype=torch.float32)",
+          "            self.register_buffer('sin_cache', sin, persistent=False)",
+          "            self.register_buffer('cos_cache', cos, persistent=False)",
+          "        else:",
+          "            self.sin_cache = self.cos_cache = None",
+          "    def forward(self, input_ids, past_kvs=None):",
+          "        B, T = input_ids.shape",
+          "        device = input_ids.device",
+          "        x = self.emb(input_ids)",
+          "        past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0",
+          "        if self.sin_cache is not None:",
+          "            sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)",
+          "            cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)",
+          "        else:",
+          "            sin = cos = None",
+          "        new_kvs = []",
+          "        for i, block in enumerate(self.blocks):",
+          "            past_kv = past_kvs[i] if past_kvs is not None else None",
+          "            x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)",
+          "            new_kvs.append(present_kv)",
+          "        x = self.final_ln(x)",
+          "        logits = self.head(x)",
+          "        return logits, new_kvs",
+          "",
+          "# Adapter so trainer can import Gemma3Model(cfg)",
+          "class Gemma3Model(TinyGPTNeoX):",
+          "    def __init__(self, cfg):",
+          "        cfg2 = dict(cfg)",
+          "        cfg2['num_layers'] = int(cfg.get('n_layers', cfg.get('num_layers', 4)))",
+          "        cfg2['num_heads'] = int(cfg.get('n_heads', cfg.get('num_heads', 8)))",
+          "        cfg2['emb_dim'] = int(cfg.get('emb_dim', cfg.get('emb_dim', 256)))",
+          "        cfg2['vocab_size'] = int(cfg.get('vocab_size', cfg.get('vocab_size')))",
+          "        cfg2['max_seq_len'] = int(cfg.get('context_length', cfg.get('max_seq_len', 512)))",
+          "        if 'ff_mult' not in cfg2:",
+          "            if 'hidden_dim' in cfg2 and cfg2.get('emb_dim'):",
+          "                try:",
+          "                    cfg2['ff_mult'] = max(1, int(cfg2['hidden_dim'] // cfg2['emb_dim']))",
+          "                except Exception:",
+          "                    cfg2['ff_mult'] = 4",
+          "            else:",
+          "                cfg2['ff_mult'] = int(cfg.get('ff_mult', 4))",
+          "        cfg2.setdefault('dropout', float(cfg.get('dropout', 0.0)))",
+          "        super().__init__(cfg2)",
+        ]
 
-def rotate_half(x):
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    return torch.stack((-x2, x1), dim=-1).reshape_as(x)
+        MODEL_PY = "\n".join(MODEL_PY_LINES)
 
-def apply_rotary_pos_emb(q, k, sin, cos):
-    q_rot = (q * cos) + (rotate_half(q) * sin)
-    k_rot = (k * cos) + (rotate_half(k) * sin)
-    return q_rot, k_rot
+        def safe_make_dirs(p):
+            if p:
+                os.makedirs(p, exist_ok=True)
 
-def make_rotary_sin_cos(seq_len, rotary_dim, device, dtype=torch.float32):
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device=device, dtype=dtype) / rotary_dim))
-    positions = torch.arange(seq_len, device=device, dtype=dtype)
-    freqs = torch.einsum("i,j->ij", positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.sin(), emb.cos()
+        def normalize_layer_types(val, default_n):
+            # accept list, comma-separated string, or single string
+            if isinstance(val, list):
+                return [str(x) for x in val]
+            if isinstance(val, str):
+                # split CSV if contains comma
+                if "," in val:
+                    return [x.strip() for x in val.split(",") if x.strip()]
+                return [val.strip()]
+            # fallback
+            return ["full_attention"] * default_n
 
-class MaskedMultiHeadAttention(nn.Module):
-    def __init__(self, emb_dim, num_heads, rotary_pct=0.25, dropout=0.0):
-        super().__init__()
-        assert emb_dim % num_heads == 0
-        self.emb_dim = emb_dim
-        self.num_heads = num_heads
-        self.head_dim = emb_dim // num_heads
-        self.rotary_pct = rotary_pct
-        self.rotary_dim = int(self.head_dim * rotary_pct)
-        if self.rotary_dim % 2 != 0:
-            self.rotary_dim -= 1
-        self.qkv_proj = nn.Linear(emb_dim, emb_dim * 3, bias=False)
-        self.out_proj = nn.Linear(emb_dim, emb_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
-        B, T, E = x.shape
-        qkv = self.qkv_proj(x).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        if self.rotary_dim > 0 and sin is not None and cos is not None:
-            q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
-            k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
-            sin = sin.view(1, 1, T, self.rotary_dim)
-            cos = cos.view(1, 1, T, self.rotary_dim)
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin, cos)
-            q = torch.cat((q_rot, q_pass), dim=-1)
-            k = torch.cat((k_rot, k_pass), dim=-1)
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-        present_kv = (k, v)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if attn_mask is None:
-            q_len, k_len = q.size(2), k.size(2)
-            mask = torch.ones((q_len, k_len), device=x.device, dtype=torch.bool).tril()
-            attn_mask = mask.unsqueeze(0).unsqueeze(0)
-        attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
-        attn_probs = self.dropout(torch.softmax(attn_scores, dim=-1))
-        out = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, E)
-        return self.out_proj(out), present_kv
-
-class FeedForward(nn.Module):
-    def __init__(self, emb_dim, ff_mult=4, dropout=0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(emb_dim, emb_dim * ff_mult)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(emb_dim * ff_mult, emb_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        return self.dropout(self.fc2(self.act(self.fc1(x))))
-
-class NeoXBlock(nn.Module):
-    def __init__(self, emb_dim, num_heads, rotary_pct=0.25, ff_mult=4, dropout=0.0):
-        super().__init__()
-        self.ln_attn = nn.LayerNorm(emb_dim)
-        self.ln_ff = nn.LayerNorm(emb_dim)
-        self.attn = MaskedMultiHeadAttention(emb_dim, num_heads, rotary_pct, dropout)
-        self.ff = FeedForward(emb_dim, ff_mult, dropout)
-
-    def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
-        norm_x = self.ln_attn(x)
-        attn_out, present_kv = self.attn(norm_x, sin, cos, attn_mask, past_kv)
-        x = x + attn_out
-        norm_x = self.ln_ff(x)
-        ff_out = self.ff(norm_x)
-        x = x + ff_out
-        return x, present_kv
-
-class TinyGPTNeoX(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        vocab_size, emb_dim = cfg["vocab_size"], cfg["emb_dim"]
-        num_layers = cfg.get("num_layers", 4)
-        num_heads = cfg.get("num_heads", 8)
-        rotary_pct = cfg.get("rotary_pct", 0.25)
-        self.emb = nn.Embedding(vocab_size, emb_dim)
-        self.pos_max = cfg.get("max_seq_len", 512)
-        self.blocks = nn.ModuleList([
-            NeoXBlock(emb_dim, num_heads, rotary_pct,
-                      ff_mult=cfg.get("ff_mult", 4),
-                      dropout=cfg.get("dropout", 0.0))
-            for _ in range(num_layers)
-        ])
-        self.final_ln = nn.LayerNorm(emb_dim)
-        self.head = nn.Linear(emb_dim, vocab_size, bias=False)
-        self.head.weight = self.emb.weight
-        rotary_dim = self.blocks[0].attn.rotary_dim
-        if rotary_dim > 0:
-            sin, cos = make_rotary_sin_cos(self.pos_max, rotary_dim, device="cpu", dtype=torch.float32)
-            self.register_buffer("sin_cache", sin, persistent=False)
-            self.register_buffer("cos_cache", cos, persistent=False)
-        else:
-            self.sin_cache = self.cos_cache = None
-
-    def forward(self, input_ids, past_kvs=None):
-        B, T = input_ids.shape
-        x = self.emb(input_ids)
-        past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
-        if self.sin_cache is not None:
-            sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
-            cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
-        else:
-            sin = cos = None
-        new_kvs = []
-        for i, block in enumerate(self.blocks):
-            past_kv = past_kvs[i] if past_kvs is not None else None
-            x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
-            new_kvs.append(present_kv)
-        x = self.final_ln(x)
-        logits = self.head(x)
-        return logits, new_kvs
-'''
-
-        def write_output(path, value, mode="w"):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, mode, encoding="utf-8") as f:
-                if isinstance(value, (dict, list)):
-                    json.dump(value, f, indent=2)
-                else:
-                    f.write(str(value))
+        def coerce_numeric_fields(cfg):
+            # ensure the trainer required numeric keys are plain python ints/floats
+            int_keys = ["context_length", "sliding_window", "emb_dim", "n_heads", "n_layers",
+                        "head_dim", "hidden_dim", "n_kv_groups"]
+            float_keys = ["rope_base", "rope_local_base", "rotary_pct"]
+            for k in int_keys:
+                if k in cfg:
+                    try:
+                        cfg[k] = int(cfg[k])
+                    except Exception:
+                        # attempt parse if list or numpy scalar
+                        if isinstance(cfg[k], (list, tuple)) and len(cfg[k])>0:
+                            cfg[k] = int(cfg[k][0])
+                        else:
+                            cfg[k] = int(float(cfg[k]))
+            for k in float_keys:
+                if k in cfg:
+                    try:
+                        cfg[k] = float(cfg[k])
+                    except Exception:
+                        if isinstance(cfg[k], (list, tuple)) and len(cfg[k])>0:
+                            cfg[k] = float(cfg[k][0])
+                        else:
+                            cfg[k] = float(cfg[k])
+            # ensure dtype is a string
+            if "dtype" in cfg:
+                cfg["dtype"] = str(cfg["dtype"])
+            return cfg
 
         def main():
             ap = argparse.ArgumentParser()
@@ -191,52 +240,145 @@ class TinyGPTNeoX(nn.Module):
             ap.add_argument("--model_py", required=True)
             args = ap.parse_args()
 
-            # Validate tokenizer file
-            if not os.path.exists(args.tokenizer_json):
-                print(f"[ERROR] Tokenizer file not found: {args.tokenizer_json}")
+            # load tokenizer
+            try:
+                tok = Tokenizer.from_file(args.tokenizer_json)
+                vocab_size = tok.get_vocab_size()
+            except Exception as e:
+                print(f"[ERROR] Failed to load tokenizer: {e}")
                 sys.exit(1)
 
-            # Read tokenizer to get vocab size
-            tok = Tokenizer.from_file(args.tokenizer_json)
-            vocab_size = tok.get_vocab_size()
-            print(f"[INFO] Loaded tokenizer with vocab_size={vocab_size}")
+            # base config (defaults)
+            CONFIG = {
+                "vocab_size": int(vocab_size),
+                "emb_dim": 256,
+                "num_layers": int(args.num_layers),
+                "num_heads": 8,
+                "max_seq_len": 512,
+                "ff_mult": 4,
+                "dropout": 0.0,
+            }
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model_dtype = torch.float16 if device == "cuda" else torch.float32
 
-            CONFIG = {
-                "vocab_size": vocab_size,
-                "emb_dim": 512,
-                "num_heads": 8,
-                "num_layers": args.num_layers,
-                "ff_mult": 4,
-                "dropout": 0.0,
-                "rotary_pct": 0.25,
-                "max_seq_len": 512,
-                "dtype": "float16" if model_dtype == torch.float16 else "float32",
+            # trainer-required defaults
+            trainer_defaults = {
+                "context_length": int(CONFIG.get("max_seq_len", 2048)),
+                "sliding_window": int(min(512, CONFIG.get("max_seq_len", 2048))),
+                "emb_dim": int(CONFIG.get("emb_dim", 256)),
+                "n_heads": int(CONFIG.get("num_heads", 8)),
+                "n_layers": int(CONFIG.get("num_layers", 4)),
+                "head_dim": int(CONFIG.get("head_dim") or (int(CONFIG.get("emb_dim", 256)) // max(1, int(CONFIG.get("num_heads", 8))))),
+                "hidden_dim": int(CONFIG.get("hidden_dim") or int(CONFIG.get("emb_dim", 256) * 4)),
+                "rope_base": float(CONFIG.get("rope_base", 1000000.0)),
+                "rope_local_base": float(CONFIG.get("rope_local_base", 10000.0)),
+                "n_kv_groups": int(CONFIG.get("n_kv_groups", 1)),
+                "qk_norm": bool(CONFIG.get("qk_norm", True)),
+                "layer_types": ["full_attention"] * int(CONFIG.get("num_layers", 4)),
             }
 
-            # Save config and model source
-            write_output(args.model_config, CONFIG)
-            model_src = textwrap.dedent(MODEL_PY.lstrip("\n"))
-            write_output(args.model_py, model_src)
+            # merge and coerce types (explicit CONFIG overrides defaults)
+            merged_cfg = {**trainer_defaults, **CONFIG}
 
-            # Import saved model source and instantiate model
-            spec = importlib.util.spec_from_file_location("tinygpt_neox_model", args.model_py)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            # normalize layer_types if someone passed string or CSV
+            merged_cfg["layer_types"] = normalize_layer_types(merged_cfg.get("layer_types"), int(merged_cfg.get("n_layers", merged_cfg.get("num_layers", 4))))
 
-            model = mod.TinyGPTNeoX(CONFIG)
+            # final dtype string
+            dtype_name = "float16" if model_dtype == torch.float16 else "float32"
+            merged_cfg["dtype"] = dtype_name
+
+            # coerce numeric types to plain python int/float (very important to avoid 'list / int' issues)
+            merged_cfg = coerce_numeric_fields(merged_cfg)
+
+            # Diagnostic: print final config and types so trainer issues are visible in logs
+            try:
+                print("[INFO] Final merged_cfg (json):")
+                print(json.dumps(merged_cfg, indent=2))
+                print("[INFO] TYPES SUMMARY:")
+                for k,v in merged_cfg.items():
+                    print(f"  - {k}: {type(v).__name__}")
+            except Exception as e:
+                print(f"[WARN] Could not emit config dump: {e}")
+
+            # write model_py artifact (exact path) and a companion .py file (for robust importing)
+            try:
+                safe_make_dirs(os.path.dirname(args.model_py) or ".")
+                # write the artifact path (this is what KFP captures)
+                with open(args.model_py, "w", encoding="utf-8") as f:
+                    f.write(MODEL_PY)
+                print(f"[INFO] Model code saved to {args.model_py}")
+                # companion .py for human readability and import convenience
+                companion = args.model_py if args.model_py.endswith(".py") else args.model_py + ".py"
+                safe_make_dirs(os.path.dirname(companion) or ".")
+                with open(companion, "w", encoding="utf-8") as f:
+                    f.write(MODEL_PY)
+                print(f"[INFO] Companion model source saved to {companion} (for import)")
+            except Exception as e:
+                print(f"[ERROR] Failed to write model_py artifact(s): {e}")
+                sys.exit(1)
+
+            # exec MODEL_PY locally to build model and save weights
+            try:
+                exec(MODEL_PY, globals())
+                print("[INFO] Executed MODEL_PY into current namespace")
+            except Exception as e:
+                print(f"[ERROR] exec(MODEL_PY) failed: {e}")
+                sys.exit(1)
+
+            # Initialize the model and save weights
+            try:
+                model = globals()["TinyGPTNeoX"](merged_cfg).to(device)
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize TinyGPTNeoX: {e}")
+                sys.exit(1)
+
             if model_dtype == torch.float16:
                 model.half()
-            model.to(device).eval()
+            model.eval()
+            print("[INFO] Model initialized")
 
-            # Save weights
-            os.makedirs(os.path.dirname(args.model_weights) or ".", exist_ok=True)
-            torch.save(model.state_dict(), args.model_weights)
+            try:
+                summary(model, input_data=torch.randint(0, merged_cfg["vocab_size"], (1, 32)).to(device))
+            except Exception as e:
+                print(f"[WARN] Could not run torchinfo.summary: {e}")
 
-            n_params = sum(p.numel() for p in model.parameters())
-            print(f"[INFO] TinyGPTNeoX init complete: layers={CONFIG['num_layers']} params={n_params} device={device}")
+            try:
+                safe_make_dirs(os.path.dirname(args.model_weights) or ".")
+                torch.save(model.state_dict(), args.model_weights)
+                print(f"[INFO] Weights saved to {args.model_weights}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save weights: {e}")
+                sys.exit(1)
+
+            # ensure JSON-friendly primitives and write model_config
+            try:
+                cfg_to_save = dict(merged_cfg)
+                # final ensure: convert any numpy scalars, bool-likes etc to python primitives
+                for k in list(cfg_to_save.keys()):
+                    val = cfg_to_save[k]
+                    # numpy ints/floats have item() method, lists/tuples left as-is (layer_types)
+                    try:
+                        if hasattr(val, "item"):
+                            cfg_to_save[k] = val.item()
+                        # bools are fine
+                    except Exception:
+                        pass
+                safe_make_dirs(os.path.dirname(args.model_config) or ".")
+                with open(args.model_config, "w", encoding="utf-8") as f:
+                    json.dump(cfg_to_save, f, indent=2)
+                print(f"[INFO] Model config saved to {args.model_config}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save model_config: {e}")
+                sys.exit(1)
+
+            # done
+            try:
+                n_params = sum(p.numel() for p in model.parameters())
+            except Exception:
+                n_params = 0
+            print(f"[INFO] Total parameters: {n_params:,}")
+            print("[INFO] Model creation completed successfully!")
 
         if __name__ == "__main__":
             main()
