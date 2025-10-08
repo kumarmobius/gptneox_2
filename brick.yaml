@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoX implemented
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -316,71 +316,75 @@ implementation:
             # ------------------------------
             # Save config (robust for brick2 expectations)
             # ------------------------------
+            # ------------------------------
+              
             try:
                 # dtype name for trainer compatibility
                 dtype_name = "float16" if model_dtype == torch.float16 else "float32"
-
+            
                 # Start from CONFIG and normalize/ensure keys brick2 expects
                 cfg_to_save = dict(CONFIG) if isinstance(CONFIG, dict) else {}
                 cfg_to_save["dtype"] = dtype_name
-
+            
                 # context_length fallback chain: explicit -> max_seq_len -> context -> 512
                 ctx = cfg_to_save.get("context_length",
                                       cfg_to_save.get("max_seq_len",
                                                       cfg_to_save.get("context", 512)))
                 cfg_to_save["context_length"] = int(ctx)
+            
                 # ensure max_seq_len is present too
                 cfg_to_save["max_seq_len"] = int(cfg_to_save.get("max_seq_len", cfg_to_save["context_length"]))
-
+            
                 # sliding_window default used by brick2
                 cfg_to_save["sliding_window"] = int(cfg_to_save.get("sliding_window",
-                                            min(512, cfg_to_save["max_seq_len"])))
-
+                                                    min(512, cfg_to_save["max_seq_len"])))
+            
                 # determine num_layers value (respect n_layers if present)
                 default_num_layers = int(getattr(args, "num_layers", 4) or 4)
                 num_layers_val = int(cfg_to_save.get("num_layers", cfg_to_save.get("n_layers", default_num_layers)))
                 cfg_to_save["num_layers"] = num_layers_val
-
+            
                 # layer_types default
                 cfg_to_save["layer_types"] = cfg_to_save.get("layer_types", ["full_attention"] * num_layers_val)
-
+            
                 # rotary/rope/gating defaults
                 cfg_to_save["rope_base"] = float(cfg_to_save.get("rope_base", 1000000.0))
                 cfg_to_save["rope_local_base"] = float(cfg_to_save.get("rope_local_base", 10000.0))
                 cfg_to_save["n_kv_groups"] = int(cfg_to_save.get("n_kv_groups", 1))
                 cfg_to_save["qk_norm"] = bool(cfg_to_save.get("qk_norm", True))
-
-                # core architecture fields (ensure ints)
-                # cfg_to_save["vocab_size"] = int(cfg_to_save.get("vocab_size", cfg_to_save.get("vocab", vocab_size)))
-                cfg_to_save["emb_dim"] = int(cfg_to_save.get("emb_dim", cfg_to_save.get("d_model", 256)))
-                cfg_to_save["num_heads"] = int(cfg_to_save.get("num_heads", cfg_to_save.get("n_heads", 8)))
-                cfg_to_save["head_dim"] = int(cfg_to_save.get("head_dim", max(1, cfg_to_save["emb_dim"] // cfg_to_save["num_heads"])))
-                # cfg_to_save["hidden_dim"] = int(cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * int(cfg_to_save.get("ff_mult", 4))))
-                # cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // max(1, cfg_to_save["emb_dim"]))))
-
+            
+                # --- core architecture fields ---
                 # Ensure emb_dim is int
                 emb_dim = cfg_to_save.get("emb_dim", 256)
                 if isinstance(emb_dim, list):
-                    emb_dim = emb_dim[0]  # take first element if list
+                    emb_dim = emb_dim[0]
                 cfg_to_save["emb_dim"] = int(emb_dim)
-                
+            
+                # Ensure num_heads is int
+                num_heads = cfg_to_save.get("num_heads", 8)
+                if isinstance(num_heads, list):
+                    num_heads = num_heads[0]
+                cfg_to_save["num_heads"] = int(num_heads)
+            
+                # Compute head_dim safely
+                cfg_to_save["head_dim"] = max(1, cfg_to_save["emb_dim"] // cfg_to_save["num_heads"])
+            
                 # Ensure ff_mult is int
                 ff_mult = cfg_to_save.get("ff_mult", 4)
                 if isinstance(ff_mult, list):
                     ff_mult = ff_mult[0]
                 cfg_to_save["ff_mult"] = int(ff_mult)
-                
+            
                 # Ensure hidden_dim is int
                 hidden_dim = cfg_to_save.get("hidden_dim", cfg_to_save["emb_dim"] * cfg_to_save["ff_mult"])
                 if isinstance(hidden_dim, list):
                     hidden_dim = hidden_dim[0]
                 cfg_to_save["hidden_dim"] = int(hidden_dim)
-                
-                # Now safe to compute ff_mult if missing
+            
+                # Recompute ff_mult safely if missing
                 cfg_to_save["ff_mult"] = int(cfg_to_save.get("ff_mult", max(1, cfg_to_save["hidden_dim"] // cfg_to_save["emb_dim"])))
-
-
-                # add param counts for debugging
+            
+                # Add param counts for debugging
                 try:
                     total_params = int(sum(int(p.numel()) for p in model.parameters()))
                     trainable_params = int(sum(int(p.numel()) for p in model.parameters() if p.requires_grad))
@@ -389,22 +393,23 @@ implementation:
                     trainable_params = 0
                 cfg_to_save["total_parameters"] = total_params
                 cfg_to_save["trainable_parameters"] = trainable_params
-
-                # Debug prints (safe: use .get so missing keys don't raise)
+            
+                # Debug prints
                 print(f"[DEBUG] Writing model_config with keys: {sorted(list(cfg_to_save.keys()))}")
                 print("[DEBUG] " + " ".join(f"{k}={repr(cfg_to_save.get(k))}" for k in
                       ("context_length", "sliding_window", "vocab_size", "emb_dim", "num_layers", "num_heads", "dtype", "total_parameters", "trainable_parameters")))
                 print(f"[DEBUG] params: total={total_params:,}, trainable={trainable_params:,}")
-
+            
                 # Write JSON config
                 safe_make_dirs(os.path.dirname(args.model_config) or ".")
                 with open(args.model_config, "w", encoding="utf-8") as f:
                     json.dump(cfg_to_save, f, indent=2)
-
+            
                 print(f"[INFO] Model config saved to {args.model_config}")
             except Exception as e:
                 print(f"[ERROR] Failed to save model config to {args.model_config}: {e}")
                 sys.exit(1)
+
 
             # Final info
             try:
