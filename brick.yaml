@@ -1,4 +1,4 @@
-name: GPTNeoX Model
+name: GPTNeoX model
 description: Builds an untrained TinyGPTNeoX model from tokenizer vocab and hyperparams, saves initial weights, config, and model source.
 inputs:
   - name: tokenizer_json
@@ -21,14 +21,14 @@ implementation:
       - -u
       - -c
       - |
-        import subprocess, sys, os, json, argparse, importlib.util, shutil
+        import subprocess, sys, os, json, argparse, textwrap
         # Install runtime deps (quiet)
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir", "torch", "tokenizers", "torchinfo", "numpy"], check=True)
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
 
-        # === embedded model source (written to model_py at runtime) ===
+        # === embedded model source (will be written to model_py at runtime) ===
         MODEL_PY = '''
         import math
         import torch
@@ -182,45 +182,26 @@ implementation:
             ap.add_argument("--model_py", required=True)
             args = ap.parse_args()
 
-            # ------------------------------
-            # 1) Write the model_py artifact at the exact path provided (so KFP captures it)
-            # 2) Also create a companion .py file (args.model_py + '.py') and import from that
-            # ------------------------------
+            # --- write model_py artifact (so KFP can capture it) ---
             try:
-                # ensure parent dir exists for the artifact path
                 safe_make_dirs(os.path.dirname(args.model_py) or ".")
                 with open(args.model_py, "w", encoding="utf-8") as f:
                     f.write(MODEL_PY)
-                print(f"[INFO] Model artifact saved to {args.model_py}")
-
-                # create a companion .py file for reliable import by importlib
-                companion_py = args.model_py if args.model_py.endswith(".py") else args.model_py + ".py"
-                safe_make_dirs(os.path.dirname(companion_py) or ".")
-                # write the same content (overwrite if same as artifact)
-                with open(companion_py, "w", encoding="utf-8") as f:
-                    f.write(MODEL_PY)
-                model_py_import_path = os.path.abspath(companion_py)
-                print(f"[INFO] Companion model source for import: {model_py_import_path}")
+                print(f"[INFO] Model code saved to {args.model_py}")
             except Exception as e:
-                print(f"[ERROR] Failed to write model source files: {e}")
+                print(f"[ERROR] Failed to write model_py to {args.model_py}: {e}")
                 sys.exit(1)
 
-            # Import the model module from the companion .py
+            # --- load model definitions into this process (avoid importlib issues) ---
             try:
-                spec = importlib.util.spec_from_file_location("tinygpt_neox_model", model_py_import_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError(f"spec creation failed for {model_py_import_path}")
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules["tinygpt_neox_model"] = mod
-                spec.loader.exec_module(mod)
-                print("[INFO] Model module loaded successfully")
+                exec(MODEL_PY, globals())
+                print("[INFO] Executed MODEL_PY into current namespace")
             except Exception as e:
-                print(f"[ERROR] Could not load model module from {model_py_import_path}: {e}")
+                print(f"[ERROR] exec(MODEL_PY) failed: {e}")
                 sys.exit(1)
 
-            # === Build Config from tokenizer ===
+            # --- build CONFIG from tokenizer ---
             try:
-                safe_make_dirs(os.path.dirname(args.tokenizer_json) or ".")
                 tok = Tokenizer.from_file(args.tokenizer_json)
                 vocab_size = tok.get_vocab_size()
             except Exception as e:
@@ -237,15 +218,15 @@ implementation:
                 "dropout": 0.0,
             }
 
-            device = torch.device("cpu")
-            model_dtype = torch.float32
+            # device + dtype selection
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model_dtype = torch.float16 if device == "cuda" else torch.float32
 
-            # === Initialize model ===
-            print("[INFO] Initializing model...")
+            # Initialize model (TinyGPTNeoX should be defined by exec above)
             try:
-                model = mod.TinyGPTNeoX(CONFIG).to(device)
+                model = globals()["TinyGPTNeoX"](CONFIG).to(device)
             except Exception as e:
-                print(f"[ERROR] Failed to initialize model: {e}")
+                print(f"[ERROR] Failed to initialize TinyGPTNeoX: {e}")
                 sys.exit(1)
 
             if model_dtype == torch.float16:
@@ -253,15 +234,14 @@ implementation:
             model.eval()
             print("[INFO] Model initialized")
 
-            # Print model summary (best-effort)
-            print("[INFO] Model summary:")
+            # Model summary (best-effort)
             try:
                 summary(model, input_data=torch.randint(0, CONFIG["vocab_size"], (1, 32)).to(device))
             except Exception as e:
-                print(f"[WARN] Could not run summary: {e}")
+                print(f"[WARN] Could not run torchinfo.summary: {e}")
 
             # ------------------------------
-            # Save weights (code 1) — ensure parent exists
+            # Save weights (user code 1)
             # ------------------------------
             try:
                 safe_make_dirs(os.path.dirname(args.model_weights) or ".")
@@ -272,7 +252,7 @@ implementation:
                 sys.exit(1)
 
             # ------------------------------
-            # Save config (code 2) — ensure parent exists
+            # Save config (user code 2)
             # ------------------------------
             try:
                 dtype_name = "float16" if model_dtype == torch.float16 else "float32"
@@ -290,9 +270,7 @@ implementation:
                 n_params = sum(p.numel() for p in model.parameters())
             except Exception:
                 n_params = 0
-            num_layers = CONFIG.get("num_layers", 0)
             print(f"[INFO] Total parameters: {n_params:,}")
-            print(f"[INFO] Number of layers: {num_layers}")
             print("[INFO] Model creation completed successfully!")
 
         if __name__ == "__main__":
