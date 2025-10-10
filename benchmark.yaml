@@ -1,26 +1,29 @@
 name: Evaluate LLM Benchmarks
 description: Runs IFEval, BBH, MATH, GPQA (+best-effort MUSR, MMLU-Pro) on the trained model, logging CO₂.
+
 inputs:
   - name: model_py_in
-    type: Data
+    type: data
   - name: model_config
-    type: Data
+    type: data
   - name: model_weights
-    type: Model
+    type: model
   - name: tokenizer_json
-    type: Model
+    type: model
   - name: tasks
-    type: String
+    type: string
     default: "ifeval,bbh,math,gpqa,musr,mmlu_pro"
   - name: max_new_tokens
-    type: Integer
-    default: "64"
+    type: integer
+    default: 64
   - name: batch_size
-    type: Integer
-    default: "1"
+    type: integer
+    default: 1
+
 outputs:
   - name: benchmarks_json
-    type: Data
+    type: data
+
 implementation:
   container:
     image: nikhilv215/nesy-factory:v20
@@ -321,20 +324,19 @@ implementation:
 
         if __name__ == "__main__":
             main()
-  args:
-    - --model_py_in
-    - {inputPath: model_py_in}
-    - --model_config
-    - {inputPath: model_config}
-    - --model_weights
-    - {inputPath: model_weights}
-    - --tokenizer_json
-    - {inputPath: tokenizer_json}
-    - --tasks
-    - {inputValue: tasks}
-    - --max_new_tokens
-    - {inputValue: max_new_tokens}
-    - --batch_size
-    - {inputValue: batch_size}
-    - --benchmarks_json
-    - {outputPath: benchmarks_json}
+      - --model_py_in
+      - {inputPath: model_py_in}
+      - --model_config
+      - {inputPath: model_config}
+      - --model_weights
+      - {inputPath: model_weights}
+      - --tokenizer_json
+      - {inputPath: tokenizer_json}
+      - --tasks
+      - {inputValue: tasks}
+      - --max_new_tokens
+      - {inputValue: max_new_tokens}
+      - --batch_size
+      - {inputValue: batch_size}
+      - --benchmarks_json
+      - {outputPath: benchmarks_json}
