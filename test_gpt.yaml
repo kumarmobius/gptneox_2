@@ -23,12 +23,11 @@ implementation:
       - |
         import subprocess, sys, os, json, argparse, importlib.util, textwrap
 
-        # Install deps BEFORE importing them
-        subprocess.run(
-          [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
-           "torch", "tokenizers", "torchinfo", "numpy"],
-          check=True
-        )
+        # subprocess.run(
+        #   [sys.executable, "-m", "pip", "install", "--quiet", "--no-cache-dir",
+        #    "torch", "tokenizers", "torchinfo", "numpy"],
+        #   check=True
+        # )
 
         from torchinfo import summary
         import torch
