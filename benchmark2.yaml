@@ -25,13 +25,13 @@ outputs:
 
 implementation:
   container:
-    image: nikhilv215/nesy-factory:v20
+    image: kumar2004/kumar:v1
     command:
       - python3
       - -u
       - -c
       - |
-        import os, sys, json, argparse, importlib.util, shutil, tempfile, gc, subprocess
+        import os, sys, json, argparse, importlib.util, shutil, tempfile, gc
         from pathlib import Path
 
         def safe_write_json(path, obj):
@@ -39,29 +39,7 @@ implementation:
           with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2)
 
-        # ------------------------------------------------------------------
-        # Optional dependency bootstrap (keeps YAML structure unchanged)
-        # If codecarbon or lm-eval are missing, try to pip install quietly.
-        # ------------------------------------------------------------------
-        _bootstrap = []
-        try:
-          import codecarbon  # noqa: F401
-        except Exception:
-          _bootstrap.append("codecarbon==2.3.5")
-        try:
-          import lm_eval  # noqa: F401
-        except Exception:
-          _bootstrap.append("lm-eval==0.4.3")
-        if _bootstrap:
-          try:
-            subprocess.run(
-              [sys.executable, "-m", "pip", "install", "--quiet", "--no-warn-script-location"] + _bootstrap,
-              check=True
-            )
-          except Exception:
-            pass  # continue; we'll record import errors below
-
-        # deferred imports with error capture
+        # deferred imports with error capture (no installs here)
         torch = None
         Tokenizer = None
         EmissionsTracker = None
@@ -102,7 +80,7 @@ implementation:
         except Exception as e:
           import_errors["lm-eval"] = str(e)
 
-        # IMPORTANT: avoid "NoneType takes no arguments"
+        # avoid subclassing NoneType
         LMBase = LM if LM is not None else object
 
         class GPTNeoXAdapter(LMBase):
@@ -233,20 +211,20 @@ implementation:
             "lm_eval": {},
           }
 
-          # Hard-require only torch + tokenizers here
+          # core libs required
           if any(k in import_errors for k in ("torch", "tokenizers")):
             result["error"] = "Missing core library (torch or tokenizers). See 'imports'."
             safe_write_json(args.benchmarks_json, result)
             return
 
-          # Validate files
+          # validate files
           for pth in [args.model_py_in, args.model_config, args.model_weights, args.tokenizer_json]:
             if not os.path.exists(pth):
               result["error"] = f"Missing input file: {pth}"
               safe_write_json(args.benchmarks_json, result)
               return
 
-          # Ensure importable .py
+          # ensure importable .py
           model_py_path = args.model_py_in
           if not model_py_path.endswith(".py"):
             tmp_dir = tempfile.mkdtemp(prefix="model_src_")
@@ -264,7 +242,7 @@ implementation:
           max_new = int(args.max_new_tokens)
           bs = int(args.batch_size)
 
-          # Import model module
+          # import model module
           try:
             spec = importlib.util.spec_from_file_location("user_model", model_py_path)
             if spec is None or spec.loader is None:
@@ -277,7 +255,7 @@ implementation:
             safe_write_json(args.benchmarks_json, result)
             return
 
-          # Instantiate model (Gemma3Model or TinyGPTNeoX)
+          # instantiate model
           try:
             ModelClass = getattr(mod, "Gemma3Model", None) or getattr(mod, "TinyGPTNeoX", None)
             if ModelClass is None:
@@ -306,7 +284,7 @@ implementation:
           requested = [t.strip() for t in args.tasks.split(",") if t.strip()]
           result["tasks_requested"] = requested
 
-          # If lm-eval not available, skip tasks gracefully but still succeed
+          # if lm-eval not available, skip but succeed
           if simple_evaluate is None or TaskManager is None or LM is None:
             result["status"] = "ok"
             result["tasks_skipped"] = requested
@@ -337,7 +315,7 @@ implementation:
           except Exception as e:
             result["notes"].append(f"CodeCarbon tracker not started: {e}")
 
-          # Run evaluation
+          # run evaluation
           try:
             eval_dict = simple_evaluate(
               model=adapter,
