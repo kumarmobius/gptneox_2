@@ -1,4 +1,4 @@
-name: LLM Benchmarks
+name: LLM Benchmark
 description: Runs IFEval, BBH, MATH, GPQA (+best-effort MUSR, MMLU-Pro) on the trained model, logging CO₂.
 inputs:
   - name: model_py_in
@@ -47,17 +47,21 @@ implementation:
         TaskManager = None
         simple_evaluate = None
         import_errors = {}
+        versions = {}
 
         try:
           import torch as _torch
           import torch.nn.functional as F  # noqa: F401
           torch = _torch
+          versions["torch"] = torch.__version__
         except Exception as e:
           import_errors["torch"] = str(e)
 
         try:
+          import tokenizers as _toks_mod
           from tokenizers import Tokenizer as _Tokenizer
           Tokenizer = _Tokenizer
+          versions["tokenizers"] = getattr(_toks_mod, "__version__", "unknown")
         except Exception as e:
           import_errors["tokenizers"] = str(e)
 
@@ -204,6 +208,7 @@ implementation:
             "error": None,
             "notes": [],
             "imports": import_errors,
+            "versions": versions,
             "emissions_kg": None,
             "tasks_requested": [],
             "tasks_run": [],
@@ -233,9 +238,22 @@ implementation:
             model_py_path = tmp_py
             print(f"[INFO] Using importable model file: {model_py_path}")
 
+          # load config
           with open(args.model_config, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-          tok = Tokenizer.from_file(args.tokenizer_json)
+
+          # --- tokenizer load guarded (this is where your crash happened) ---
+          try:
+            tok = Tokenizer.from_file(args.tokenizer_json)
+          except Exception as e:
+            result["error"] = f"Failed to load tokenizer JSON: {e}"
+            result["notes"].append(
+              "Likely a version mismatch or a corrupted tokenizer file. "
+              "Ensure the tokenizers library version in this brick matches the version used to create the tokenizer."
+            )
+            safe_write_json(args.benchmarks_json, result)
+            return
+          # ------------------------------------------------------------------
 
           device = "cuda" if torch.cuda.is_available() else "cpu"
           max_seq = int(cfg.get("max_seq_len", cfg.get("context_length", 512)))
