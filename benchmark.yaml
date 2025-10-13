@@ -1,4 +1,4 @@
-name: Evaluate LLM Benchmarks
+name: LLM Benchmarks
 description: Runs IFEval, BBH, MATH, GPQA (+best-effort MUSR, MMLU-Pro) on the trained model, logging CO₂.
 inputs:
   - name: model_py_in
@@ -18,316 +18,326 @@ inputs:
   - name: batch_size
     type: Integer
     default: "1"
-
 outputs:
   - name: benchmarks_json
     type: Data
-
 implementation:
   container:
     image: nikhilv215/nesy-factory:v20
     command:
-      - python3
-      - -u
+      - sh
       - -c
       - |
+        # Best-effort install if not already present; do NOT fail pipeline if network flakes
         (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-cache-dir --no-warn-script-location \
           'codecarbon==2.3.5' 'lm-eval==0.4.3' \
-          || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location \
-          'codecarbon==2.3.5' 'lm-eval==0.4.3' --user) && exec python3 -u -c "$0" "$@"
+          || true) && exec python3 -u -c "$0" "$@"
       - |
         import os, sys, json, argparse, importlib.util, shutil, tempfile, gc
-        from pathlib import Path
-
+        # ---------- helpers ----------
+        def safe_mkdir(p):
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
         def safe_write_json(path, obj):
-          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-          with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2)
+            safe_mkdir(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(obj, f, indent=2)
 
-        # deferred imports with error capture
-        torch = None
-        Tokenizer = None
-        EmissionsTracker = None
-        LM = None
-        TaskManager = None
-        simple_evaluate = None
+        # ---------- lazy/guarded imports ----------
         import_errors = {}
+        torch = None; Tokenizer = None
+        EmissionsTracker = None
+        LM = None; TaskManager = None; simple_evaluate = None
 
         try:
-          import torch as _torch
-          import torch.nn.functional as F  # noqa: F401
-          torch = _torch
+            import torch as _torch
+            torch = _torch
         except Exception as e:
-          import_errors["torch"] = str(e)
+            import_errors["torch"] = str(e)
 
         try:
-          from tokenizers import Tokenizer as _Tokenizer
-          Tokenizer = _Tokenizer
+            from tokenizers import Tokenizer as _Tokenizer
+            Tokenizer = _Tokenizer
         except Exception as e:
-          import_errors["tokenizers"] = str(e)
+            import_errors["tokenizers"] = str(e)
 
         try:
-          from codecarbon import EmissionsTracker as _EmissionsTracker
-          EmissionsTracker = _EmissionsTracker
+            from codecarbon import EmissionsTracker as _EmissionsTracker
+            EmissionsTracker = _EmissionsTracker
         except Exception as e:
-          import_errors["codecarbon"] = str(e)
+            import_errors["codecarbon"] = str(e)
 
         try:
-          from lm_eval.evaluator import simple_evaluate as _simple_evaluate
-          from lm_eval.api.model import LM as _LM
-          from lm_eval.tasks import TaskManager as _TaskManager
-          simple_evaluate = _simple_evaluate
-          LM = _LM
-          TaskManager = _TaskManager
-        except Exception as e:
-          import_errors["lm-eval"] = str(e)
-
-        class GPTNeoXAdapter(LM):
-          def __init__(self, model, tokenizer, max_seq_len=512, device="cpu", batch_size=1, max_new_tokens=64):
-            super().__init__()
-            self.model = model
-            self.tok = tokenizer
-            self._device = device
-            self._batch_size = batch_size
-            self._max_seq_len = max_seq_len
-            self._max_new_tokens = max_new_tokens
-
-          @property
-          def eot_token_id(self):
-            for tok in ("<eos>", "</s>", "[EOS]", "<|endoftext|>"):
-              i = self.tok.token_to_id(tok)
-              if i is not None:
-                return i
-            return None
-
-          def max_length(self):
-            return self._max_seq_len
-
-          def device(self):
-            return self._device
-
-          def tok_encode(self, s):
-            return self.tok.encode(s).ids
-
-          def tok_decode(self, ids):
-            return self.tok.decode(ids)
-
-          @torch.no_grad()
-          def _forward_logits(self, ids):
-            x = torch.tensor(ids, dtype=torch.long, device=self._device).unsqueeze(0)
-            logits, _ = self.model(x)
-            return logits
-
-          @torch.no_grad()
-          def loglikelihood(self, requests):
-            out = []
-            for context, continuation in requests:
-              c_ids = self.tok_encode(context)
-              t_ids = self.tok_encode(continuation)
-              ids = (c_ids + t_ids)[-self._max_seq_len:]
-              logits = self._forward_logits(ids)
-              T_all = logits.size(1)
-              T_cont = min(len(t_ids), max(0, T_all - 1))
-              logp = 0.0
-              greedy = True
-              start = T_all - T_cont - 1
-              for i in range(T_cont):
-                step_idx = start + i
-                if step_idx < 0:
-                  continue
-                probs = torch.log_softmax(logits[0, step_idx], dim=-1)
-                tok_id = t_ids[i]
-                logp += probs[tok_id].item()
-                greedy = greedy and (int(torch.argmax(probs)) == tok_id)
-              out.append((float(logp), bool(greedy)))
-            return out
-
-          @torch.no_grad()
-          def loglikelihood_rolling(self, requests):
-            results = []
-            for (text,) in requests:
-              ids = self.tok_encode(text)
-              if len(ids) < 2:
-                results.append(0.0)
-                continue
-              win = self._max_seq_len
-              total_lp, count = 0.0, 0
-              i = 0
-              while i < len(ids) - 1:
-                chunk = ids[i:i+win]
-                if len(chunk) < 2:
-                  break
-                logits = self._forward_logits(chunk)
-                steps = len(chunk) - 1
-                for k in range(steps):
-                  probs = torch.log_softmax(logits[0, k], dim=-1)
-                  total_lp += probs[chunk[k+1]].item()
-                  count += 1
-                i += win - 1
-              results.append(total_lp)
-            return results
-
-          @torch.no_grad()
-          def generate_until(self, requests):
-            outputs = []
-            for context, until in requests:
-              base_ids = self.tok_encode(context)
-              ids = base_ids[-(self._max_seq_len-1):]
-              text_out = ""
-              for _ in range(self._max_new_tokens):
-                logits = self._forward_logits(ids)
-                next_id = int(torch.argmax(logits[0, -1]).item())
-                ids.append(next_id)
-                text_out = self.tok_decode(ids[len(base_ids):])
-                if any(u in text_out for u in until):
-                  break
-                if self.eot_token_id is not None and next_id == self.eot_token_id:
-                  break
-              outputs.append(text_out)
-            return outputs
-
-        def main():
-          p = argparse.ArgumentParser()
-          p.add_argument("--model_py_in", required=True)
-          p.add_argument("--model_config", required=True)
-          p.add_argument("--model_weights", required=True)
-          p.add_argument("--tokenizer_json", required=True)
-          p.add_argument("--tasks", required=True)
-          p.add_argument("--max_new_tokens", required=True)
-          p.add_argument("--batch_size", required=True)
-          p.add_argument("--benchmarks_json", required=True)
-          args = p.parse_args()
-
-          result = {
-            "status": "error",
-            "error": None,
-            "notes": [],
-            "imports": import_errors,
-            "emissions_kg": None,
-            "tasks_requested": [],
-            "tasks_run": [],
-            "tasks_skipped": [],
-            "lm_eval": {},
-          }
-
-          # Fail fast if critical imports missing
-          if any(k in import_errors for k in ("torch", "tokenizers", "lm-eval", "codecarbon")):
-            result["error"] = "One or more required libraries failed to import. See 'imports'."
-            safe_write_json(args.benchmarks_json, result)
-            print("[FATAL] import failures; wrote JSON.")
-            return
-
-          # Validate files
-          for pth in [args.model_py_in, args.model_config, args.model_weights, args.tokenizer_json]:
-            if not os.path.exists(pth):
-              result["error"] = f"Missing input file: {pth}"
-              safe_write_json(args.benchmarks_json, result)
-              print("[FATAL]", result["error"])
-              return
-
-          # Ensure importable .py
-          model_py_path = args.model_py_in
-          if not model_py_path.endswith(".py"):
-            tmp_dir = tempfile.mkdtemp(prefix="model_src_")
-            tmp_py = os.path.join(tmp_dir, "user_model.py")
-            shutil.copyfile(model_py_path, tmp_py)
-            model_py_path = tmp_py
-            print(f"[INFO] Using importable model file: {model_py_path}")
-
-          with open(args.model_config, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-          tok = Tokenizer.from_file(args.tokenizer_json)
-
-          device = "cuda" if torch.cuda.is_available() else "cpu"
-          max_seq = int(cfg.get("max_seq_len", cfg.get("context_length", 512)))
-          max_new = int(args.max_new_tokens)
-          bs = int(args.batch_size)
-
-          # Import model module
-          try:
-            spec = importlib.util.spec_from_file_location("user_model", model_py_path)
-            if spec is None or spec.loader is None:
-              raise RuntimeError(f"Could not load module spec from {model_py_path}")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["user_model"] = mod
-            spec.loader.exec_module(mod)
-          except Exception as e:
-            result["error"] = f"Failed to import model file: {e}"
-            safe_write_json(args.benchmarks_json, result)
-            return
-
-          # Instantiate model (Gemma3Model wrapper or TinyGPTNeoX)
-          try:
-            ModelClass = getattr(mod, "Gemma3Model", None) or getattr(mod, "TinyGPTNeoX", None)
-            if ModelClass is None:
-              raise RuntimeError("Neither Gemma3Model nor TinyGPTNeoX found in model file.")
-            model = ModelClass(cfg)
-            state = torch.load(args.model_weights, map_location="cpu")
-            model.load_state_dict(state, strict=False)
-            model_dtype = str(cfg.get("dtype", "float32")).lower()
-            if device == "cuda" and model_dtype in ("float16", "fp16", "half"):
-              model.half()
-            model.to(device).eval()
-          except Exception as e:
-            result["error"] = f"Failed to construct/load model: {e}"
-            safe_write_json(args.benchmarks_json, result)
-            return
-
-          adapter = GPTNeoXAdapter(
-            model=model,
-            tokenizer=tok,
-            max_seq_len=max_seq,
-            device=device,
-            batch_size=bs,
-            max_new_tokens=max_new,
-          )
-
-          requested = [t.strip() for t in args.tasks.split(",") if t.strip()]
-          result["tasks_requested"] = requested
-          tm = TaskManager(include_path=None)
-          available, skipped = [], []
-          for t in requested:
+            from lm_eval.evaluator import simple_evaluate as _simple_evaluate
+            from lm_eval.api.model import LM as _LM
             try:
-              _ = tm.get_task(t)
-              available.append(t)
+                # lm-eval 0.4.x
+                from lm_eval.tasks import TaskManager as _TaskManager
             except Exception:
-              skipped.append(t)
-          result["tasks_skipped"] = skipped
+                _TaskManager = None
+            simple_evaluate = _simple_evaluate
+            LM = _LM
+            TaskManager = _TaskManager
+        except Exception as e:
+            import_errors["lm-eval"] = str(e)
 
-          emissions = None
-          tracker = None
-          try:
-            tracker = EmissionsTracker(log_level="error")
-            tracker.start()
-          except Exception as e:
-            result["notes"].append(f"CodeCarbon tracker not started: {e}")
+        # ---------- tiny adapter for lm-eval ----------
+        class GPTNeoXAdapter(LM):
+            def __init__(self, model, tokenizer, max_seq_len=512, device="cpu", batch_size=1, max_new_tokens=64):
+                super().__init__()
+                self.model = model
+                self.tok = tokenizer
+                self._device = device
+                self._batch_size = batch_size
+                self._max_seq_len = max_seq_len
+                self._max_new_tokens = max_new_tokens
 
-          # Run evaluation
-          try:
-            eval_dict = simple_evaluate(
-              model=adapter,
-              tasks=available,
-              task_manager=tm,
-              num_fewshot=0,
-            )
-            result["lm_eval"] = eval_dict
-            result["tasks_run"] = available
-            result["status"] = "ok"
-          except Exception as e:
-            result["error"] = f"lm-eval failed: {e}"
+            @property
+            def eot_token_id(self):
+                for tok in ("<eos>", "</s>", "[EOS]", "<|endoftext|>"):
+                    try:
+                        i = self.tok.token_to_id(tok)
+                        if i is not None:
+                            return i
+                    except Exception:
+                        pass
+                return None
 
-          try:
-            if tracker is not None:
-              emissions = tracker.stop()
-              result["emissions_kg"] = float(emissions) if emissions is not None else None
-          except Exception as e:
-            result["notes"].append(f"CodeCarbon stop error: {e}")
+            def max_length(self): return self._max_seq_len
+            def device(self): return self._device
+            def tok_encode(self, s): return self.tok.encode(s).ids
+            def tok_decode(self, ids): return self.tok.decode(ids)
 
-          safe_write_json(args.benchmarks_json, result)
-          gc.collect()
+            @torch.no_grad()
+            def _forward_logits(self, ids):
+                x = torch.tensor(ids, dtype=torch.long, device=self._device).unsqueeze(0)
+                logits, _ = self.model(x)
+                return logits
+
+            @torch.no_grad()
+            def loglikelihood(self, requests):
+                out = []
+                for context, continuation in requests:
+                    c_ids = self.tok_encode(context)
+                    t_ids = self.tok_encode(continuation)
+                    ids = (c_ids + t_ids)[-self._max_seq_len:]
+                    logits = self._forward_logits(ids)
+                    T_all = logits.size(1)
+                    T_cont = min(len(t_ids), max(0, T_all - 1))
+                    logp, greedy = 0.0, True
+                    start = T_all - T_cont - 1
+                    for i in range(T_cont):
+                        step_idx = start + i
+                        if step_idx < 0: continue
+                        probs = torch.log_softmax(logits[0, step_idx], dim=-1)
+                        tok_id = t_ids[i]
+                        logp += probs[tok_id].item()
+                        greedy = greedy and (int(torch.argmax(probs)) == tok_id)
+                    out.append((float(logp), bool(greedy)))
+                return out
+
+            @torch.no_grad()
+            def loglikelihood_rolling(self, requests):
+                results = []
+                for (text,) in requests:
+                    ids = self.tok_encode(text)
+                    if len(ids) < 2:
+                        results.append(0.0); continue
+                    win = self._max_seq_len
+                    total_lp, i = 0.0, 0
+                    while i < len(ids) - 1:
+                        chunk = ids[i:i+win]
+                        if len(chunk) < 2: break
+                        logits = self._forward_logits(chunk)
+                        for k in range(len(chunk) - 1):
+                            probs = torch.log_softmax(logits[0, k], dim=-1)
+                            total_lp += probs[chunk[k+1]].item()
+                        i += win - 1
+                    results.append(total_lp)
+                return results
+
+            @torch.no_grad()
+            def generate_until(self, requests):
+                outputs = []
+                for context, until in requests:
+                    base_ids = self.tok_encode(context)
+                    ids = base_ids[-(self._max_seq_len-1):]
+                    text_out = ""
+                    for _ in range(self._max_new_tokens):
+                        logits = self._forward_logits(ids)
+                        next_id = int(torch.argmax(logits[0, -1]).item())
+                        ids.append(next_id)
+                        text_out = self.tok_decode(ids[len(base_ids):])
+                        if any(u in text_out for u in until): break
+                        if self.eot_token_id is not None and next_id == self.eot_token_id: break
+                    outputs.append(text_out)
+                return outputs
+
+        # ---------- main ----------
+        def main():
+            p = argparse.ArgumentParser()
+            p.add_argument("--model_py_in", required=True)
+            p.add_argument("--model_config", required=True)
+            p.add_argument("--model_weights", required=True)
+            p.add_argument("--tokenizer_json", required=True)
+            p.add_argument("--tasks", required=True)
+            p.add_argument("--max_new_tokens", required=True)
+            p.add_argument("--batch_size", required=True)
+            p.add_argument("--benchmarks_json", required=True)
+            args = p.parse_args()
+
+            result = {
+                "status": "error",
+                "error": None,
+                "notes": [],
+                "imports": import_errors,
+                "emissions_kg": None,
+                "tasks_requested": [],
+                "tasks_run": [],
+                "tasks_skipped": [],
+                "lm_eval": {},
+            }
+
+            try:
+                # basic presence of core libs
+                if torch is None or Tokenizer is None:
+                    result["error"] = "Missing core library (torch or tokenizers)."
+                    return result
+
+                # validate input files
+                for pth in [args.model_py_in, args.model_config, args.model_weights, args.tokenizer_json]:
+                    if not os.path.exists(pth):
+                        result["error"] = f"Missing input file: {pth}"
+                        return result
+
+                # load config + tok
+                with open(args.model_config, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                tok = Tokenizer.from_file(args.tokenizer_json)
+
+                # import user model file (.py or raw)
+                model_py_path = args.model_py_in
+                if not model_py_path.endswith(".py"):
+                    tmp_dir = tempfile.mkdtemp(prefix="model_src_")
+                    tmp_py = os.path.join(tmp_dir, "user_model.py")
+                    shutil.copyfile(model_py_path, tmp_py)
+                    model_py_path = tmp_py
+
+                spec = importlib.util.spec_from_file_location("user_model", model_py_path)
+                if spec is None or spec.loader is None:
+                    result["error"] = f"Could not load module spec from {model_py_path}"
+                    return result
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["user_model"] = mod
+                spec.loader.exec_module(mod)
+
+                # construct model (Gemma3Model wrapper or TinyGPTNeoX)
+                ModelClass = getattr(mod, "Gemma3Model", None) or getattr(mod, "TinyGPTNeoX", None)
+                if ModelClass is None:
+                    result["error"] = "Neither Gemma3Model nor TinyGPTNeoX found in model file."
+                    return result
+
+                device = "cuda" if (hasattr(torch, "cuda") and torch.cuda.is_available()) else "cpu"
+                max_seq = int(cfg.get("max_seq_len", cfg.get("context_length", 512)))
+                model = ModelClass(cfg)
+                state = torch.load(args.model_weights, map_location="cpu")
+                model.load_state_dict(state, strict=False)
+                model_dtype = str(cfg.get("dtype", "float32")).lower()
+                if device == "cuda" and model_dtype in ("float16", "fp16", "half"):
+                    model.half()
+                model.to(device).eval()
+
+                adapter = GPTNeoXAdapter(
+                    model=model,
+                    tokenizer=tok,
+                    max_seq_len=max_seq,
+                    device=device,
+                    batch_size=int(args.batch_size),
+                    max_new_tokens=int(args.max_new_tokens),
+                )
+
+                requested = [t.strip() for t in args.tasks.split(",") if t.strip()]
+                result["tasks_requested"] = requested
+
+                # handle missing lm-eval gracefully
+                if simple_evaluate is None or LM is None or TaskManager is None:
+                    result["status"] = "ok"
+                    result["notes"].append("lm-eval not available; all tasks skipped.")
+                    result["tasks_skipped"] = requested
+                    return result
+
+                # build task manager & filter tasks that exist
+                try:
+                    tm = TaskManager(include_path=None)
+                except Exception as e:
+                    result["status"] = "ok"
+                    result["notes"].append(f"TaskManager init failed: {e}; all tasks skipped.")
+                    result["tasks_skipped"] = requested
+                    return result
+
+                available, skipped = [], []
+                for t in requested:
+                    try:
+                        _ = tm.get_task(t)
+                        available.append(t)
+                    except Exception:
+                        skipped.append(t)
+                result["tasks_skipped"] = skipped
+
+                # start emissions if available
+                tracker = None
+                if EmissionsTracker is not None:
+                    try:
+                        tracker = EmissionsTracker(log_level="error")
+                        tracker.start()
+                    except Exception as e:
+                        result["notes"].append(f"CodeCarbon start failed: {e}")
+                else:
+                    result["notes"].append("CodeCarbon not available; emissions not recorded.")
+
+                # run eval
+                try:
+                    eval_dict = simple_evaluate(model=adapter, tasks=available, task_manager=tm, num_fewshot=0)
+                    result["lm_eval"] = eval_dict
+                    result["tasks_run"] = available
+                    result["status"] = "ok"
+                except Exception as e:
+                    result["error"] = f"lm-eval failed: {e}"
+
+                # stop emissions
+                if tracker is not None:
+                    try:
+                        emissions = tracker.stop()
+                        result["emissions_kg"] = float(emissions) if emissions is not None else None
+                    except Exception as e:
+                        result["notes"].append(f"CodeCarbon stop failed: {e}")
+
+                return result
+            finally:
+                # ensure GPU mem freed if present
+                try:
+                    if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         if __name__ == "__main__":
-          main()
+            # run and always write the JSON
+            ap = argparse.ArgumentParser()
+            ap.add_argument("--model_py_in", required=True)
+            ap.add_argument("--model_config", required=True)
+            ap.add_argument("--model_weights", required=True)
+            ap.add_argument("--tokenizer_json", required=True)
+            ap.add_argument("--tasks", required=True)
+            ap.add_argument("--max_new_tokens", required=True)
+            ap.add_argument("--batch_size", required=True)
+            ap.add_argument("--benchmarks_json", required=True)
+            args = ap.parse_args()
+            res = main()
+            if res is None:
+                res = {"status": "error", "error": "Unknown error before result construction."}
+            safe_write_json(args.benchmarks_json, res)
     args:
       - --model_py_in
       - {inputPath: model_py_in}
