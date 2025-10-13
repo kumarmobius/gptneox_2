@@ -1,4 +1,4 @@
-name: LLM Benchmarks
+name: LLM Benchmark
 description: Runs IFEval, BBH, MATH, GPQA (+best-effort MUSR, MMLU-Pro) on the trained model, logging CO₂.
 inputs:
   - name: model_py_in
@@ -256,8 +256,8 @@ implementation:
             # quick sanity check: file must *look* like a HF tokenizer json
             with open(tk_path, "r", encoding="utf-8", errors="ignore") as _f:
                 _head = _f.read(4000)
-            if ("\"model\"" not in _head) or ("\"type\"" not in _head):
-                raise Exception(f"File at {tk_path} does not appear to be a Hugging Face tokenizer.json")
+            if '"model"' not in _head or '"type"' not in _head::
+                raise Exception(f"File at{tk_path} does not appear to be a Hugging Face tokenizer.json")
 
             tok = Tokenizer.from_file(tk_path)
             
