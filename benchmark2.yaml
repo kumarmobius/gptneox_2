@@ -1,4 +1,4 @@
-name: LLM Benchmark
+name: LLM Benchmarks
 description: Runs IFEval, BBH, MATH, GPQA (+best-effort MUSR, MMLU-Pro) on the trained model, logging CO₂.
 inputs:
   - name: model_py_in
@@ -244,7 +244,23 @@ implementation:
 
           # --- tokenizer load guarded (this is where your crash happened) ---
           try:
-            tok = Tokenizer.from_file(args.tokenizer_json)
+            tk_path = args.tokenizer_json
+            if os.path.isdir(tk_path):
+                # if someone passed a directory, try common names inside it
+                for cand in ("tokenizer.json",):
+                    c = os.path.join(tk_path, cand)
+                    if os.path.exists(c):
+                        tk_path = c
+                        break
+            
+            # quick sanity check: file must *look* like a HF tokenizer json
+            with open(tk_path, "r", encoding="utf-8", errors="ignore") as _f:
+                _head = _f.read(4000)
+            if ("\"model\"" not in _head) or ("\"type\"" not in _head):
+                raise Exception(f"File at {tk_path} does not appear to be a Hugging Face tokenizer.json")
+
+            tok = Tokenizer.from_file(tk_path)
+            
           except Exception as e:
             result["error"] = f"Failed to load tokenizer JSON: {e}"
             result["notes"].append(
