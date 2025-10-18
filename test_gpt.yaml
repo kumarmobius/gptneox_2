@@ -39,137 +39,195 @@ implementation:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
-
+        
         def rotate_half(x):
             x1 = x[..., ::2]
             x2 = x[..., 1::2]
             return torch.stack((-x2, x1), dim=-1).reshape_as(x)
-
+        
         def apply_rotary_pos_emb(q, k, sin, cos):
             q_rot = (q * cos) + (rotate_half(q) * sin)
             k_rot = (k * cos) + (rotate_half(k) * sin)
             return q_rot, k_rot
-
+        
         def make_rotary_sin_cos(seq_len, rotary_dim, device, dtype=torch.float32):
             inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device=device, dtype=dtype) / rotary_dim))
             positions = torch.arange(seq_len, device=device, dtype=dtype)
             freqs = torch.einsum("i,j->ij", positions, inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1)
             return emb.sin(), emb.cos()
-
-        class MaskedMultiHeadAttention(nn.Module):
-            def __init__(self, emb_dim, num_heads, rotary_pct=0.25, dropout=0.0):
+        
+        class NeoXAttention(nn.Module):
+            def __init__(self, hidden_size, num_heads, rotary_pct=0.25, dropout=0.0):
                 super().__init__()
-                assert emb_dim % num_heads == 0
-                self.emb_dim = emb_dim
+                assert hidden_size % num_heads == 0
+                self.hidden_size = hidden_size
                 self.num_heads = num_heads
-                self.head_dim = emb_dim // num_heads
+                self.head_dim = hidden_size // num_heads
                 self.rotary_pct = rotary_pct
                 self.rotary_dim = int(self.head_dim * rotary_pct)
                 if self.rotary_dim % 2 != 0:
                     self.rotary_dim -= 1
-                self.qkv_proj = nn.Linear(emb_dim, emb_dim * 3, bias=False)
-                self.out_proj = nn.Linear(emb_dim, emb_dim, bias=False)
+        
+                # EleutherAI naming: packed qkv linear and dense out projection
+                self.query_key_value = nn.Linear(hidden_size, self.head_dim * num_heads * 3, bias=True)
+                self.dense = nn.Linear(self.head_dim * num_heads, hidden_size, bias=True)
                 self.dropout = nn.Dropout(dropout)
-
+        
             def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
-                B, T, E = x.shape
-                qkv = self.qkv_proj(x).view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv[0], qkv[1], qkv[2]
+                # x: (B, T, hidden_size)
+                B, T, H = x.shape
+                qkv = self.query_key_value(x)  # (B, T, 3 * hidden)
+                # reshape to (B, T, 3, num_heads, head_dim)
+                qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv[0], qkv[1], qkv[2]  # each: (B, num_heads, T, head_dim)
+        
+                # Rotary
                 if self.rotary_dim > 0 and sin is not None and cos is not None:
                     q_rot, q_pass = q[..., :self.rotary_dim], q[..., self.rotary_dim:]
                     k_rot, k_pass = k[..., :self.rotary_dim], k[..., self.rotary_dim:]
-                    sin = sin.view(1, 1, T, self.rotary_dim)
-                    cos = cos.view(1, 1, T, self.rotary_dim)
-                    q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin, cos)
+                    sin_v = sin.view(1, 1, T, self.rotary_dim)
+                    cos_v = cos.view(1, 1, T, self.rotary_dim)
+                    q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, sin_v, cos_v)
                     q = torch.cat((q_rot, q_pass), dim=-1)
                     k = torch.cat((k_rot, k_pass), dim=-1)
+        
+                # handle caching (past_kv: tuple of (past_k, past_v) each shape (B, num_heads, past_len, head_dim))
                 if past_kv is not None:
                     past_k, past_v = past_kv
+                    # concat along time dimension
                     k = torch.cat([past_k, k], dim=2)
                     v = torch.cat([past_v, v], dim=2)
+        
                 present_kv = (k, v)
+        
+                # compute attention
                 scale = 1.0 / math.sqrt(self.head_dim)
-                attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, num_heads, q_len, k_len)
+        
+                # build causal mask allowing access to all past tokens
+                q_len, k_len = q.size(2), k.size(2)
                 if attn_mask is None:
-                    q_len, k_len = q.size(2), k.size(2)
-                    mask = torch.ones((q_len, k_len), device=x.device, dtype=torch.bool).tril()
-                    attn_mask = mask.unsqueeze(0).unsqueeze(0)
+                    # allow each query position i to attend to keys <= past_len + i
+                    past_len = k_len - q_len if k_len >= q_len else 0
+                    # idx arrays on device
+                    idx_q = torch.arange(q_len, device=x.device)
+                    idx_k = torch.arange(k_len, device=x.device)
+                    mask = idx_k.unsqueeze(0) <= (past_len + idx_q.unsqueeze(1))  # (q_len, k_len)
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, q_len, k_len)
+        
                 attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
-                attn_probs = self.dropout(torch.softmax(attn_scores, dim=-1))
-                out = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, E)
-                return self.out_proj(out), present_kv
-
-        class FeedForward(nn.Module):
-            def __init__(self, emb_dim, ff_mult=4, dropout=0.0):
+                attn_probs = torch.softmax(attn_scores, dim=-1)
+                attn_probs = self.dropout(attn_probs)
+                out = torch.matmul(attn_probs, v)  # (B, num_heads, q_len, head_dim)
+                out = out.transpose(1, 2).contiguous().view(B, q_len, -1)  # (B, q_len, hidden)
+                out = self.dense(out)
+                return out, present_kv
+        
+        class NeoXMLP(nn.Module):
+            def __init__(self, hidden_size, ff_mult=4, dropout=0.0):
                 super().__init__()
-                self.fc1 = nn.Linear(emb_dim, emb_dim * ff_mult)
+                inner = hidden_size * ff_mult
+                self.dense_h_to_4h = nn.Linear(hidden_size, inner, bias=True)
+                self.dense_4h_to_h = nn.Linear(inner, hidden_size, bias=True)
                 self.act = nn.GELU()
-                self.fc2 = nn.Linear(emb_dim * ff_mult, emb_dim)
                 self.dropout = nn.Dropout(dropout)
-
+        
             def forward(self, x):
-                return self.dropout(self.fc2(self.act(self.fc1(x))))
-
-        class NeoXBlock(nn.Module):
-            def __init__(self, emb_dim, num_heads, rotary_pct=0.25, ff_mult=4, dropout=0.0):
+                x = self.dense_h_to_4h(x)
+                x = self.act(x)
+                x = self.dense_4h_to_h(x)
+                x = self.dropout(x)
+                return x
+        
+        class NeoXLayer(nn.Module):
+            def __init__(self, hidden_size, num_heads, rotary_pct=0.25, ff_mult=4, dropout=0.0, use_parallel_residual=False):
                 super().__init__()
-                self.ln_attn = nn.LayerNorm(emb_dim)
-                self.ln_ff = nn.LayerNorm(emb_dim)
-                self.attn = MaskedMultiHeadAttention(emb_dim, num_heads, rotary_pct, dropout)
-                self.ff = FeedForward(emb_dim, ff_mult, dropout)
-
+                self.input_layernorm = nn.LayerNorm(hidden_size, elementwise_affine=True)
+                # In sequential variant we use post_attention_layernorm before MLP
+                self.post_attention_layernorm = nn.LayerNorm(hidden_size, elementwise_affine=True)
+                self.attention = NeoXAttention(hidden_size, num_heads, rotary_pct=rotary_pct, dropout=dropout)
+                self.mlp = NeoXMLP(hidden_size, ff_mult=ff_mult, dropout=dropout)
+                self.use_parallel_residual = use_parallel_residual
+        
             def forward(self, x, sin=None, cos=None, attn_mask=None, past_kv=None):
-                norm_x = self.ln_attn(x)
-                attn_out, present_kv = self.attn(norm_x, sin, cos, attn_mask, past_kv)
-                x = x + attn_out
-                norm_x = self.ln_ff(x)
-                ff_out = self.ff(norm_x)
-                x = x + ff_out
-                return x, present_kv
-
-        class TinyGPTNeoX(nn.Module):
-            def __init__(self, cfg):
+                if self.use_parallel_residual:
+                    # parallel residual: both blocks see same normalized input; outputs summed into residual
+                    norm_x = self.input_layernorm(x)
+                    attn_out, present_kv = self.attention(norm_x, sin=sin, cos=cos, attn_mask=attn_mask, past_kv=past_kv)
+                    ff_out = self.mlp(norm_x)
+                    x = x + attn_out + ff_out
+                    return x, present_kv
+                else:
+                    # sequential: attention -> add -> post_attention_layernorm -> mlp -> add
+                    norm_x = self.input_layernorm(x)
+                    attn_out, present_kv = self.attention(norm_x, sin=sin, cos=cos, attn_mask=attn_mask, past_kv=past_kv)
+                    x = x + attn_out
+                    norm_x2 = self.post_attention_layernorm(x)
+                    ff_out = self.mlp(norm_x2)
+                    x = x + ff_out
+                    return x, present_kv
+        
+        class GPTNeoXForCausalLM(nn.Module):
+            def __init__(self, cfg: Dict[str, Any]):
                 super().__init__()
-                vocab_size, emb_dim = cfg["vocab_size"], cfg["emb_dim"]
-                num_layers = cfg.get("num_layers", 4)
-                num_heads = cfg.get("num_heads", 8)
+                vocab_size = cfg["vocab_size"]
+                hidden_size = cfg["hidden_size"]
+                num_layers = cfg["num_layers"]
+                num_heads = cfg["num_heads"]
+                ff_mult = cfg.get("ff_mult", 4)
                 rotary_pct = cfg.get("rotary_pct", 0.25)
-                self.emb = nn.Embedding(vocab_size, emb_dim)
-                self.pos_max = cfg.get("max_seq_len", 512)
-                self.blocks = nn.ModuleList([
-                    NeoXBlock(emb_dim, num_heads, rotary_pct,
-                              ff_mult=cfg.get("ff_mult", 4),
-                              dropout=cfg.get("dropout", 0.0))
+                max_seq_len = cfg.get("max_seq_len", 512)
+                dropout = cfg.get("dropout", 0.0)
+                use_parallel_residual = cfg.get("use_parallel_residual", False)
+                tie_word_embeddings = cfg.get("tie_word_embeddings", True)
+        
+                # embedding / output naming consistent with EleutherAI
+                self.gpt_neox = nn.Module()
+                # create named submodules by setting attributes on module
+                self.gpt_neox.embed_in = nn.Embedding(vocab_size, hidden_size)
+                self.gpt_neox.layers = nn.ModuleList([
+                    NeoXLayer(hidden_size, num_heads, rotary_pct=rotary_pct, ff_mult=ff_mult, dropout=dropout,
+                             use_parallel_residual=use_parallel_residual)
                     for _ in range(num_layers)
                 ])
-                self.final_ln = nn.LayerNorm(emb_dim)
-                self.head = nn.Linear(emb_dim, vocab_size, bias=False)
-                self.head.weight = self.emb.weight
-                rotary_dim = self.blocks[0].attn.rotary_dim
+                self.gpt_neox.final_layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=True)
+        
+                # output embedding / head
+                # create embed_out as a module to produce key "gpt_neox.embed_out.weight"
+                self.gpt_neox.embed_out = nn.Linear(hidden_size, vocab_size, bias=False)
+                if tie_word_embeddings:
+                    # tie out weight to embed_in weights
+                    self.gpt_neox.embed_out.weight = self.gpt_neox.embed_in.weight
+                # store rotary caches
+                rotary_dim = int((hidden_size // num_heads) * rotary_pct)
                 if rotary_dim > 0:
-                    sin, cos = make_rotary_sin_cos(self.pos_max, rotary_dim, device="cpu", dtype=torch.float32)
+                    sin, cos = make_rotary_sin_cos(max_seq_len, rotary_dim, device="cpu", dtype=torch.float32)
                     self.register_buffer("sin_cache", sin, persistent=False)
                     self.register_buffer("cos_cache", cos, persistent=False)
                 else:
-                    self.sin_cache = self.cos_cache = None
-
+                    self.sin_cache = None
+                    self.cos_cache = None
+        
             def forward(self, input_ids, past_kvs=None):
                 B, T = input_ids.shape
-                x = self.emb(input_ids)
+                x = self.gpt_neox.embed_in(input_ids)
                 past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
-                if self.sin_cache is not None:
-                    sin = self.sin_cache[past_len:past_len + T].to(x.device).to(x.dtype)
-                    cos = self.cos_cache[past_len:past_len + T].to(x.device).to(x.dtype)
+                if getattr(self, "sin_cache", None) is not None:
+                    sin = self.sin_cache[past_len: past_len + T].to(x.device).to(x.dtype)
+                    cos = self.cos_cache[past_len: past_len + T].to(x.device).to(x.dtype)
                 else:
                     sin = cos = None
+        
                 new_kvs = []
-                for i, block in enumerate(self.blocks):
+                attn_mask = None  # letting attention build its own causal mask
+                for i, layer in enumerate(self.gpt_neox.layers):
                     past_kv = past_kvs[i] if past_kvs is not None else None
-                    x, present_kv = block(x, sin=sin, cos=cos, past_kv=past_kv)
+                    x, present_kv = layer(x, sin=sin, cos=cos, attn_mask=attn_mask, past_kv=past_kv)
                     new_kvs.append(present_kv)
-                x = self.final_ln(x)
-                logits = self.head(x)
+        
+                x = self.gpt_neox.final_layer_norm(x)
+                logits = self.gpt_neox.embed_out(x)  # linear tied or untied
                 return logits, new_kvs
 
         class Gemma3Model(TinyGPTNeoX):
