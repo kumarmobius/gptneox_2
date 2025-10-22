@@ -32,6 +32,7 @@ implementation:
         from torchinfo import summary
         import torch
         from tokenizers import Tokenizer
+        from typing import Dict, Any
 
         # === embedded model source (written to model_py at runtime) ===
         MODEL_PY = '''
@@ -39,6 +40,7 @@ implementation:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
+        from typing import Dict, Any
         
         def rotate_half(x):
             x1 = x[..., ::2]
@@ -116,7 +118,8 @@ implementation:
                     mask = idx_k.unsqueeze(0) <= (past_len + idx_q.unsqueeze(1))  # (q_len, k_len)
                     attn_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, q_len, k_len)
         
-                attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
+                neg_inf = torch.finfo(attn_scores.dtype).min  # dtype-safe
+                attn_scores = attn_scores.masked_fill(~attn_mask, neg_inf)
                 attn_probs = torch.softmax(attn_scores, dim=-1)
                 attn_probs = self.dropout(attn_probs)
                 out = torch.matmul(attn_probs, v)  # (B, num_heads, q_len, head_dim)
@@ -230,7 +233,7 @@ implementation:
                 logits = self.gpt_neox.embed_out(x)  # linear tied or untied
                 return logits, new_kvs
 
-        class Gemma3Model(TinyGPTNeoX):
+        class Gemma3Model(GPTNeoXForCausalLM):
             def forward(self, input_ids, labels=None):
                 logits, _ = super().forward(input_ids)
                 loss = None
@@ -242,8 +245,7 @@ implementation:
                         shift_labels.view(-1),
                         ignore_index=-100,
                     )
-                return (logits, loss)
-
+                return logits, loss
         '''
 
         def write_text(path, text):
@@ -283,34 +285,26 @@ implementation:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model_dtype = torch.float16 if device == "cuda" else torch.float32
 
- 
-            emb_dim = 516
+            hidden_size = 256
             num_heads = 8
             ff_mult = 4
-            head_dim = emb_dim // num_heads
-            hidden_dim = emb_dim * ff_mult
             max_seq = 3500
 
-            CONFIG = {
-                "vocab_size": vocab_size,
-                "emb_dim": emb_dim,
-                "num_heads": num_heads,
-                "num_layers": args.num_layers,
-                "ff_mult": ff_mult,
-                "hidden_dim": hidden_dim,
-                "head_dim": head_dim,
-                "dropout": 0.0,
-                "rotary_pct": 0.25,,
-                "context_length": max_seq,
-                "max_seq_len": max_seq,
-                "context_length": max_seq,
-                "sliding_window": max_seq,
-                "n_kv_groups": 1,
-                "qk_norm": False,
-                "rope_base": 10000.0,
-                "rope_local_base": 10000.0,
-                "dtype": "float16" if model_dtype == torch.float16 else "float32",
-            }
+            cfg = {
+            "vocab_size": vocab_size,
+            "hidden_size": hidden_size,
+            "num_heads": num_heads,
+            "num_layers": int(n_layers),
+            "ff_mult": ff_mult,
+            "rotary_pct": 0.25,
+            "max_seq_len": max_seq,
+            "context_length": max_seq,
+            "dropout": 0.0,
+            "use_parallel_residual": False,
+            "tie_word_embeddings": True,
+            "dtype": "float16" if model_dtype == torch.float16 else "float32",
+            "device": device
+        }
 
             # Write config & model source to artifact path
             write_json(os.path.abspath(args.model_config), CONFIG)
@@ -330,7 +324,7 @@ implementation:
             spec.loader.exec_module(mod)
 
             # Build & save weights
-            model = mod.TinyGPTNeoX(CONFIG).to(device).eval()
+            model = mod.GPTNeoXForCausalLM(CONFIG).to(device).eval()
             if model_dtype == torch.float16:
                 model.half()
 
