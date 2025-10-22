@@ -283,13 +283,13 @@ implementation:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model_dtype = torch.float16 if device == "cuda" else torch.float32
 
-            # Trainer-friendly numeric fields
-            emb_dim = 256
+ 
+            emb_dim = 516
             num_heads = 8
             ff_mult = 4
             head_dim = emb_dim // num_heads
             hidden_dim = emb_dim * ff_mult
-            max_seq = 512
+            max_seq = 3500
 
             CONFIG = {
                 "vocab_size": vocab_size,
